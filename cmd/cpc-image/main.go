@@ -684,9 +684,11 @@ func saveSCR(filename string, dest *convert.ImageCpc, params *convert.Settings) 
 		VirtualMode: params.VirtualMode,
 	}
 
-	// Get bitmap data
-	bitmapData := dest.BitmapCpc.ScreenData[:]
-	bitmapSize := len(bitmapData)
+	// Get bitmap data — slice to the real CPC bitmap size (Bug 3). ScreenData
+	// is a [0x10000]byte buffer; writing the whole 64KB would produce a file
+	// that is 128+65536 bytes instead of 128+BitmapSize(80|96, 200|272).
+	bitmapSize := cpc.BitmapSize(params.NumCols, params.NumLines)
+	bitmapData := dest.BitmapCpc.ScreenData[:bitmapSize]
 
 	// Extract palette (simplified - should use real palette from conversion)
 	palette := make([]uint16, 16)

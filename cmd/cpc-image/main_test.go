@@ -260,3 +260,44 @@ func TestCLIUnpackRejectsUnsupportedData(t *testing.T) {
 		t.Error("unpack on an unsupported/unrecognized file should fail (non-zero exit)")
 	}
 }
+
+// TestCLIConvertPNGToSCRSize (PLAN2 Bug 3, A4) verifies convert PNG -> SCR
+// writes 128 + BitmapSize(80,200) = 16464 bytes, NOT 128 + 65536.
+func TestCLIConvertPNGToSCRSize(t *testing.T) {
+	tempDir := t.TempDir()
+	pngPath := writeTestPNG(t, tempDir, "src.png")
+
+	scrPath := filepath.Join(tempDir, "out.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", pngPath, "-o", scrPath, "-f", "scr", "-m", "1"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert PNG -> SCR failed: %v", err)
+	}
+
+	scrData, err := os.ReadFile(scrPath)
+	if err != nil {
+		t.Fatalf("read SCR failed: %v", err)
+	}
+	wantSize := 128 + cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+	if len(scrData) != wantSize {
+		t.Errorf("SCR size = %d, want %d (must not be %d)", len(scrData), wantSize, 128+0x10000)
+	}
+	if !cpc.CheckAmsdos(scrData) {
+		t.Error("SCR missing valid AMSDOS header")
+	}
+
+	// Reload via LoadSCR must yield non-trivial screen data.
+	screenData, _, lerr := fileio.LoadSCR(scrData)
+	if lerr != nil {
+		t.Fatalf("LoadSCR failed: %v", lerr)
+	}
+	nonzero := false
+	for i := 128; i < len(screenData); i++ {
+		if screenData[i] != 0 {
+			nonzero = true
+			break
+		}
+	}
+	if !nonzero {
+		t.Error("SCR screen data is all zeros")
+	}
+}
