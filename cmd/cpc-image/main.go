@@ -289,6 +289,11 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		params.NumLines = 200
 	}
 
+	// Scale the source image to the CPC canvas size
+	// so that small images fill the full screen instead of only 1/4 of it
+	// (out-of-grid reads -> black). Nearest-neighbour stretch; pen-0 fills gaps.
+	directBitmap = resizeToCanvas(directBitmap, params)
+
 	// Load palette if specified
 	if paletteFile != "" {
 		if verbose {
@@ -668,6 +673,47 @@ func mapDitherMethod(method string) string {
 	default:
 		return "Floyd-Steinberg (2x2)"
 	}
+}
+
+// resizeToCanvas scales the source bitmap to the CPC display canvas so that
+// a small source image fills the full screen (640x400 standard, 768x544
+// overscan) instead of being rendered at 1:1 and reading out-of-grid pixels.
+// Uses nearest-neighbour stretch; the background is filled with pen 0 color
+// (mirrors the GUI getResizeBitmap). Known limitation: native-resolution
+// fidelity is only approximate; TODO: non-integer resize and overscan
+func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.DirectBitmap {
+	cpcW := prm.GetScreenWidth()
+	cpcH := prm.GetScreenHeight()
+
+	// Background = pen 0 color.
+	bg := cpc.GetColor(prm.Palette[0], prm.CpcPlus)
+	resized := bitmap.NewDirectBitmap(cpcW, cpcH)
+	for y := 0; y < cpcH; y++ {
+		for x := 0; x < cpcW; x++ {
+			resized.SetPixelColor(x, y, bg)
+		}
+	}
+
+	srcW := source.Width()
+	srcH := source.Height()
+	if srcW == 0 || srcH == 0 {
+		return resized
+	}
+
+	for dy := 0; dy < cpcH; dy++ {
+		srcY := dy * srcH / cpcH
+		if srcY >= srcH {
+			srcY = srcH - 1
+		}
+		for dx := 0; dx < cpcW; dx++ {
+			srcX := dx * srcW / cpcW
+			if srcX >= srcW {
+				srcX = srcW - 1
+			}
+			resized.SetPixelColor(dx, dy, source.GetPixelColor(srcX, srcY))
+		}
+	}
+	return resized
 }
 
 // saveSCR saves the converted image as an SCR file

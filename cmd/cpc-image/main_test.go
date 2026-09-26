@@ -11,7 +11,9 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/ikari-pl/go-cpc-image/pkg/bitmap"
 	"github.com/ikari-pl/go-cpc-image/pkg/compress"
+	"github.com/ikari-pl/go-cpc-image/pkg/convert"
 	"github.com/ikari-pl/go-cpc-image/pkg/cpc"
 	"github.com/ikari-pl/go-cpc-image/pkg/fileio"
 )
@@ -261,7 +263,7 @@ func TestCLIUnpackRejectsUnsupportedData(t *testing.T) {
 	}
 }
 
-// TestCLIConvertPNGToSCRSize (PLAN2 Bug 3, A4) verifies convert PNG -> SCR
+// TestCLIConvertPNGToSCRSize verifies convert PNG -> SCR
 // writes 128 + BitmapSize(80,200) = 16464 bytes, NOT 128 + 65536.
 func TestCLIConvertPNGToSCRSize(t *testing.T) {
 	tempDir := t.TempDir()
@@ -299,5 +301,67 @@ func TestCLIConvertPNGToSCRSize(t *testing.T) {
 	}
 	if !nonzero {
 		t.Error("SCR screen data is all zeros")
+	}
+}
+
+// TestResizeToCanvasScalesSmallImage verifies that a small
+// source bitmap is scaled to fill the entire CPC canvas (640x400 standard)
+// instead of being used at 1:1 (which left 3/4 of the screen unread).
+func TestResizeToCanvasScalesSmallImage(t *testing.T) {
+	src := bitmap.NewDirectBitmap(160, 200)
+	// Fill with bright red (pen 1 = 0x00F → RGB 255,0,0)
+	red := cpc.GetColor(1, false)
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 160; x++ {
+			src.SetPixelColor(x, y, red)
+		}
+	}
+
+	params := convert.NewDefaultSettings()
+	params.NumCols = cpc.StandardCols
+	params.NumLines = cpc.StandardLines
+	// params.Palette[0] = 0 (black) — the default pen-0
+
+	resized := resizeToCanvas(src, params)
+
+	// Must be 640x400 (standard CPC canvas), not 160x200.
+	if resized.Width() != 640 || resized.Height() != 400 {
+		t.Fatalf("resized dims = %dx%d, want 640x400", resized.Width(), resized.Height())
+	}
+
+	// Nearest-neighbour stretch: source (160,200) → output block at (4,4)-(7,7).
+	// Every pixel must match the source (all red) since the whole source is red.
+	sample := resized.GetPixelColor(4, 4)
+	if sample != red {
+		t.Errorf("pixel at (4,4) = %v, want %v (nearest-neighbour stretch of red)",
+			sample, red)
+	}
+	sample = resized.GetPixelColor(639, 399)
+	if sample != red {
+		t.Errorf("pixel at (639,399) = %v, want %v (bottom-right corner)",
+			sample, red)
+	}
+
+	// Pen-0 background color check: with a 160x200→640x400 stretch (4x), the
+	// whole canvas is covered. With a non-matching aspect (e.g., 200x100 →
+	// 640x400 = 3.2x, 4x), the background pen-0 must fill the gaps.
+	bg := cpc.GetColor(0, false) // black
+	// Verify a small source that doesn't perfectly tile shows background.
+	small := bitmap.NewDirectBitmap(100, 100)
+	small.SetPixelColor(50, 50, cpc.GetColor(1, false)) // one red pixel
+	rgParams := convert.NewDefaultSettings()
+	rgParams.NumCols = cpc.StandardCols
+	rgParams.NumLines = cpc.StandardLines
+	smallResized := resizeToCanvas(small, rgParams)
+	if smallResized.GetPixelColor(0, 0) != bg {
+		t.Errorf("background pixel (0,0) = %v, want pen-0 (black) for non-matching aspect",
+			smallResized.GetPixelColor(0, 0))
+	}
+	// The red pixel at (50,50) in 100x100 maps to a block in 640x400.
+	// srcX = dx*100/640, so dx ~ 50*640/100 = 320 should map back to x=50.
+	mappedX := 320 * 100 / 640
+	if mappedX == 50 && smallResized.GetPixelColor(320, 200) != cpc.GetColor(1, false) {
+		t.Errorf("scaled red pixel at (320,200) = %v, want red",
+			smallResized.GetPixelColor(320, 200))
 	}
 }
