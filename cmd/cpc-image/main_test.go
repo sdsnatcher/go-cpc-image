@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/ikari-pl/go-cpc-image/pkg/bitmap"
@@ -209,8 +210,8 @@ func TestCLIUnpackRejectsRawSCR(t *testing.T) {
 
 // TestCLIUnpackRejectsPKSAutoDetect verifies that in auto-detect mode the CLI
 // refuses to unpack a PKS file (signature "PK…"), because the column-major →
-// CPC-screen conversion that PKSL requires is not yet implemented (F2). This
-// prevents silently emitting a corrupt .SCR.
+// CPC-screen conversion is not yet implemented. This prevents silently
+// emitting a corrupt .SCR.
 //
 // It uses a real sample file shipped in the go-cpc-image-1.2.0-pks reference
 // tree (git-ignored from the repo). The path is resolved relative to this
@@ -230,7 +231,7 @@ func TestCLIUnpackRejectsPKSAutoDetect(t *testing.T) {
 	tempDir := t.TempDir()
 	rootCmd.SetArgs([]string{"unpack", "-i", pksFile, "-o", filepath.Join(tempDir, "test.scr")})
 	if err := rootCmd.Execute(); err == nil {
-		t.Error("unpack should reject PKS files in auto-detect mode until F2 is implemented")
+		t.Error("unpack should reject PKS files in auto-detect mode (decompression not implemented)")
 	}
 }
 
@@ -363,5 +364,138 @@ func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 	if mappedX == 50 && smallResized.GetPixelColor(320, 200) != cpc.GetColor(1, false) {
 		t.Errorf("scaled red pixel at (320,200) = %v, want red",
 			smallResized.GetPixelColor(320, 200))
+	}
+}
+
+// writeRGBA writes an RGBA image to a PNG file in dir and returns the path.
+func writeRGBA(t *testing.T, dir, name string, img *image.RGBA) string {
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Failed to create %s: %v", name, err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		t.Fatalf("Failed to encode %s: %v", name, err)
+	}
+	f.Close()
+	return path
+}
+
+// TestCLIConvertRoundTripPixelExact verifies that a 640×400 image made of
+// exact CPC colors survives PNG → SCR → PNG as a pixel-perfect round trip
+// (stretch is an identity at this size, the palette is embedded and re-read,
+// and -d none disables dithering).
+func TestCLIConvertRoundTripPixelExact(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 4 exact CPC colors, one per 160-px vertical stripe.
+	cpcColors := []bitmap.RgbColor{
+		cpc.CpcRgbPalette[0],  // black
+		cpc.CpcRgbPalette[6],  // bright red
+		cpc.CpcRgbPalette[24], // bright yellow
+		cpc.CpcRgbPalette[26], // bright white
+	}
+	src := image.NewRGBA(image.Rect(0, 0, 640, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 640; x++ {
+			c := cpcColors[x/160]
+			src.Set(x, y, color.RGBA{R: c.R, G: c.V, B: c.B, A: 255})
+		}
+	}
+	srcPath := writeRGBA(t, tempDir, "stripe.png", src)
+
+	// PNG → SCR (uses resizeToCanvas = identity at 640×400, -d none).
+	scrPath := filepath.Join(tempDir, "stripe.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", scrPath, "-f", "scr", "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert PNG -> SCR failed: %v", err)
+	}
+
+	// SCR → PNG (uses convertSCRToPNG + applySCRPalette + rgbaToIndexed).
+	backPath := filepath.Join(tempDir, "stripe_back.png")
+	rootCmd.SetArgs([]string{"convert", "-i", scrPath, "-o", backPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert SCR -> PNG failed: %v", err)
+	}
+
+	// Decode the round-tripped PNG and compare dimensions + pixels.
+	f, err := os.Open(backPath)
+	if err != nil {
+		t.Fatalf("open back PNG failed: %v", err)
+	}
+	defer f.Close()
+	back, _, derr := image.Decode(f)
+	if derr != nil {
+		t.Fatalf("back PNG failed to decode: %v", derr)
+	}
+	if back.Bounds().Dx() != 640 || back.Bounds().Dy() != 400 {
+		t.Fatalf("back PNG dims = %dx%d, want 640x400", back.Bounds().Dx(), back.Bounds().Dy())
+	}
+
+	mismatches := 0
+	for y := 0; y < 400 && mismatches < 5; y++ {
+		for x := 0; x < 640 && mismatches < 5; x++ {
+			c1 := color.RGBAModel.Convert(src.At(x, y)).(color.RGBA)
+			c2 := color.RGBAModel.Convert(back.At(x, y)).(color.RGBA)
+			if c1.R != c2.R || c1.G != c2.G || c1.B != c2.B {
+				mismatches++
+				t.Errorf("pixel mismatch at (%d,%d): got (%d,%d,%d) want (%d,%d,%d)",
+					x, y, c2.R, c2.G, c2.B, c1.R, c1.G, c1.B)
+			}
+		}
+	}
+	if mismatches > 0 {
+		t.Fatalf("round-trip had %d mismatching pixels (first 5 shown)", mismatches)
+	}
+}
+
+// TestCLIConvertRejectsPKSInput verifies that convert refuses a PKS-compressed
+// screen ("PKxx" signature) instead of feeding the compressed bytes to the
+// screen renderer, which would silently emit a corrupt PNG.
+func TestCLIConvertRejectsPKSInput(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// A real PKSL payload produced by the compressor, plus a bare "PKUL"
+	// (underscan) signature: every variant must be rejected, including those
+	// that ParsePKSHeader does not recognize.
+	raw := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	pksBuf := make([]byte, len(raw)*2+1024)
+	packedSize, perr := compress.NewCompressor().PKS().PackPKS(raw, len(raw), pksBuf, compress.PKSL, nil)
+	if perr != nil {
+		t.Fatalf("PackPKS failed: %v", perr)
+	}
+	pkul := append([]byte("PKUL"), raw...)
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"PKSL", pksBuf[:packedSize]},
+		{"PKUL", pkul},
+	}
+
+	// Keep the .scr extension: that is the route a user would actually take
+	// when pointing convert at a compressed screen dump.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inPath := filepath.Join(tempDir, tc.name+".scr")
+			if err := os.WriteFile(inPath, tc.data, 0644); err != nil {
+				t.Fatalf("write fixture failed: %v", err)
+			}
+
+			outPath := filepath.Join(tempDir, tc.name+".png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			err := rootCmd.Execute()
+			if err == nil {
+				t.Fatal("convert on a PKS-compressed screen should fail")
+			}
+			if !strings.Contains(err.Error(), "PKS") {
+				t.Errorf("error should mention PKS, got: %v", err)
+			}
+			if _, serr := os.Stat(outPath); serr == nil {
+				t.Error("convert must not write an output file for rejected PKS input")
+			}
+		})
 	}
 }

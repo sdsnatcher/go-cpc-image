@@ -7,9 +7,10 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif"  // Register GIF decoder
 	_ "image/jpeg" // Register JPEG decoder
-	_ "image/png"  // Register PNG decoder
+	"image/png"    // PNG decoder and encoder
 	"os"
 	"path/filepath"
 	"strings"
@@ -211,6 +212,13 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("input file does not exist: %s", inputFile)
 	}
 
+	// If the file is an .SCR input is a CPC screen file, not a bitmap image, route it
+	// to the SCR -> PNG converter instead of image.Decode (which only handles
+	// PNG/JPEG/GIF).
+	if strings.ToLower(filepath.Ext(inputFile)) == ".scr" {
+		return convertSCRToPNG(inputFile, outputFile)
+	}
+
 	// Validate mode
 	if mode < 0 || mode > 2 {
 		return fmt.Errorf("invalid mode: %d (must be 0, 1, or 2)", mode)
@@ -268,6 +276,11 @@ func runConvert(cmd *cobra.Command, args []string) error {
 
 	img, _, err := image.Decode(file)
 	if err != nil {
+		// Not a bitmap: the file may still be a CPC SCR that lacks the .scr
+		// extension. Try the SCR -> PNG route before giving up.
+		if cvtErr := convertSCRToPNG(inputFile, outputFile); cvtErr == nil {
+			return nil
+		}
 		return fmt.Errorf("failed to decode image: %w", err)
 	}
 
@@ -324,6 +337,11 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	startTime := getTimeMs()
 	numColors := convert.Convert(directBitmap, dest, params, false)
 	endTime := getTimeMs()
+
+	// The converter computes the real reduced palette in
+	// dest.BitmapCpc.Palette (FindBestColors). Sync params.Palette so the SCR
+	// / PKS embed the actually-used colors (same pattern the GUI applies).
+	copy(params.Palette[:], dest.BitmapCpc.Palette[:])
 
 	if verbose {
 		fmt.Printf("Conversion completed in %dms\n", endTime-startTime)
@@ -493,15 +511,15 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 	if cmd.Flags().Changed("method") && compressionMethod != "" {
 		method = strings.ToLower(compressionMethod)
 	} else {
-				// Auto-detection: strip a valid AMSDOS header before inspecting the
+		// Auto-detection: strip a valid AMSDOS header before inspecting the
 		// payload signatures.
 		payload := inputData
 		if len(inputData) >= 128 && cpc.CheckAmsdos(inputData) {
 			payload = inputData[128:]
 		}
-		// PKS signature ("PK…") → auto-detected. Not yet supported, because the
-		// column-major → CPC screen conversion belongs to F2. Reject now to
-		// avoid silently producing a corrupt output file.
+		// PKS signature ("PK…") → auto-detected. Not yet supported: the
+		// column-major decompression is not implemented in this command.
+		// Reject now to avoid silently producing a corrupt output file.
 		if len(payload) >= 4 && payload[0] == 'P' && payload[1] == 'K' {
 			return fmt.Errorf("unpack: PKS files are not yet supported (use --method pks, once implemented): %s", inputFile)
 		}
@@ -520,7 +538,7 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Decompressing %s to %s using %s\n", inputFile, outputFile, method)
 	}
 
-		var outputSize int
+	var outputSize int
 	switch method {
 	case "lzw":
 		outputSize, err = compressor.Depack(inputData, 0, outputBuffer, compress.Standard)
@@ -716,6 +734,194 @@ func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.
 	return resized
 }
 
+// applySCRPalette parses the embedded ModePal block from the screen data and
+// populates bmp's palette. Standard SCR mode: 17-byte block at ModePalOffset
+// (mode byte + 16 ink values). Overscan: 33-byte block at 0x600. Classic mode
+// uses 27-color ink indices (0..26, 0xFF = unused → pen 0). CPC Plus uses
+// 12-bit 0x0VBR pairs (low = B|R<<4, high = V).
+// Falls back silently to the default palette if the block is absent or
+// implausible.
+func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) {
+	if modeOffset+17 > len(screenData) {
+		return
+	}
+	modeByte := screenData[modeOffset]
+
+	if (modeByte & 0x80) != 0 {
+		// CPC Plus: 33-byte block; each pen is a low/high byte pair encoding
+		// 0x0VBR (as written by fileio.SaveSCR: low = B | R<<4, high = V).
+		if modeOffset+33 > len(screenData) {
+			return
+		}
+		bmp.CpcPlus = true
+		for i := 0; i < 16; i++ {
+			lo := screenData[modeOffset+1+i*2]
+			hi := screenData[modeOffset+2+i*2]
+			if lo == 0xFF && hi == 0xFF {
+				bmp.Palette[i] = 0 // unused pen → black
+				continue
+			}
+			bmp.Palette[i] = int(hi&0x0F)<<8 | int(lo&0x0F)<<4 | int((lo>>4)&0x0F)
+		}
+		bmp.VirtualMode = int(modeByte) & 0x03
+		return
+	}
+
+	// Classic: 17-byte block; inks 0..26 or 0xFF (unused pen). Only accept a
+	// plausible ModePal (mode 0..4, all inks valid) to avoid misreading pixel
+	// data as a palette.
+	if int(modeByte) > 4 {
+		return
+	}
+	for i := 0; i < 16; i++ {
+		b := screenData[modeOffset+1+i]
+		if b != 0xFF && b > 26 {
+			return
+		}
+	}
+	bmp.VirtualMode = int(modeByte)
+	for i := 0; i < 16; i++ {
+		ink := int(screenData[modeOffset+1+i])
+		if ink == 0xFF {
+			ink = 0 // unused pen → black
+		}
+		bmp.Palette[i] = ink
+	}
+}
+
+// rgbaToIndexed converts a rendered RGBA frame into an indexed-color image
+// using 16 palette entries ordered exactly as the SCR pens.
+// Rendered pixels come from cpc.PaletteColor, so they match the palette
+// entries exactly; a nearest-color fallback guards rounding edge cases.
+func rgbaToIndexed(img *image.RGBA, bmp *render.BitmapCpc) *image.Paletted {
+	// 16 pens in the exact order of the SCR palette.
+	palette16 := make(color.Palette, 16)
+	lookup := make(map[int]uint8, 16)
+	palRGB := make([]int, 16)
+	for i := 0; i < 16; i++ {
+		rgb := cpc.PaletteColor(bmp.Palette[i], bmp.CpcPlus)
+		palette16[i] = color.RGBA{R: uint8(rgb >> 16), G: uint8(rgb >> 8), B: uint8(rgb), A: 255}
+		palRGB[i] = rgb
+		if _, ok := lookup[rgb]; !ok {
+			lookup[rgb] = uint8(i)
+		}
+	}
+
+	bounds := img.Bounds()
+	out := image.NewPaletted(bounds, palette16)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			c := color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)
+			rgb := int(c.B) | int(c.G)<<8 | int(c.R)<<16
+			idx, ok := lookup[rgb]
+			if !ok {
+				idx = nearestPalIndex(palRGB, rgb)
+			}
+			out.SetColorIndex(x, y, idx)
+		}
+	}
+	return out
+}
+
+// nearestPalIndex returns the palette entry closest (Euclidean) to rgb.
+func nearestPalIndex(palRGB []int, rgb int) uint8 {
+	best := 0
+	bestDist := int64(1) << 62
+	for i, p := range palRGB {
+		dr := int64((p>>16)&0xFF) - int64((rgb>>16)&0xFF)
+		dg := int64((p>>8)&0xFF) - int64((rgb>>8)&0xFF)
+		db := int64(p&0xFF) - int64(rgb&0xFF)
+		d := dr*dr + dg*dg + db*db
+		if d < bestDist {
+			bestDist = d
+			best = i
+		}
+	}
+	return uint8(best)
+}
+
+// convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
+// This is the reverse direction of the normal convert command: input is .SCR,
+// output is .PNG.
+func convertSCRToPNG(inputFile, outputFile string) error {
+	data, err := os.ReadFile(inputFile)
+	if err != nil {
+		return fmt.Errorf("failed to read input file: %w", err)
+	}
+
+	payload := data
+	if len(data) >= 128 && cpc.CheckAmsdos(data) {
+		payload = data[128:]
+	}
+
+	// PKS-compressed screens carry a "PK" signature instead of raw screen
+	// data. Rendering the compressed bytes as if they were a screen would
+	// silently produce a corrupt PNG, so reject every variant explicitly.
+	if len(payload) >= 4 && payload[0] == 'P' && payload[1] == 'K' {
+		return fmt.Errorf("input file is PKS-compressed, which convert does not support: %s", inputFile)
+	}
+
+	// LoadSCR needs at least 16384 bytes; a standard SCR payload is 16336.
+	if len(payload) < 16384 {
+		pad := make([]byte, 16384)
+		copy(pad, payload)
+		payload = pad
+	}
+
+	screenData, _, lerr := fileio.LoadSCR(payload)
+	if lerr != nil {
+		return fmt.Errorf("failed to load SCR data: %w", lerr)
+	}
+
+	bmp := render.NewBitmapCpcWithParams(cpc.StandardCols, cpc.StandardLines, false)
+	copy(bmp.ScreenData[:], screenData)
+
+	// ModePal offset: standard SCR layout places the mode + palette at
+	// ModePalOffset; overscan uses a different location (0x600). The overscan
+	// signal is derived from the AMSDOS load address or the file size.
+	modeOffset := cpc.ModePalOffset
+	addr := uint16(0)
+	if len(data) >= 128 && cpc.CheckAmsdos(data) {
+		if ent, e := cpc.GetAmsdos(data); e == nil {
+			addr = ent.Address
+		}
+	}
+	if (addr == 0x0200) || (addr == 0 && len(data) >= 0x4000) {
+		modeOffset = 0x600
+	}
+
+	// Use the palette embedded in the SCR (ModePal block) instead of the
+	// fixed default palette returned by LoadSCR.
+	applySCRPalette(bmp, screenData, modeOffset)
+
+	img := bmp.RenderToRGBA()
+	if img == nil {
+		return fmt.Errorf("failed to render SCR screen data")
+	}
+
+	file, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer file.Close()
+	// Indexed-color PNG whose palette follows the SCR pen order.
+	if err := png.Encode(file, rgbaToIndexed(img, bmp)); err != nil {
+		return fmt.Errorf("failed to encode PNG: %w", err)
+	}
+
+	fileInfo, _ := os.Stat(outputFile)
+	fmt.Printf("Conversion successful!\n")
+	fmt.Printf("  Input: %s (%d bytes)\n", inputFile, len(data))
+	if fileInfo != nil {
+		fmt.Printf("  Output: %s (%d bytes)\n", outputFile, fileInfo.Size())
+	} else {
+		fmt.Printf("  Output: %s\n", outputFile)
+	}
+	fmt.Printf("  Mode: %d (%dx%d pixels)\n", bmp.VirtualMode, bmp.NumCol*8, bmp.NumLig*2)
+
+	return nil
+}
+
 // saveSCR saves the converted image as an SCR file
 func saveSCR(filename string, dest *convert.ImageCpc, params *convert.Settings) error {
 	if verbose {
@@ -840,5 +1046,3 @@ func getTimeMs() int64 {
 	// This is a placeholder - in real implementation would use time.Now().UnixMilli()
 	return 0
 }
-
-
