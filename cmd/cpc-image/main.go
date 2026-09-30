@@ -11,6 +11,7 @@ import (
 	_ "image/gif"  // Register GIF decoder
 	_ "image/jpeg" // Register JPEG decoder
 	"image/png"    // PNG decoder and encoder
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,7 +223,7 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	// to the SCR -> PNG converter instead of image.Decode (which only handles
 	// PNG/JPEG/GIF).
 	if strings.ToLower(filepath.Ext(inputFile)) == ".scr" {
-		return convertSCRToPNG(inputFile, outputFile)
+		return convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr())
 	}
 
 	// Validate mode
@@ -284,7 +285,7 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		// Not a bitmap: the file may still be a CPC SCR that lacks the .scr
 		// extension. Try the SCR -> PNG route before giving up.
-		if cvtErr := convertSCRToPNG(inputFile, outputFile); cvtErr == nil {
+		if cvtErr := convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr()); cvtErr == nil {
 			return nil
 		}
 		return fmt.Errorf("failed to decode image: %w", err)
@@ -914,11 +915,16 @@ func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.
 // (mode byte + 16 ink values). Overscan: 33-byte block at 0x600. Classic mode
 // uses 27-color ink indices (0..26, 0xFF = unused → pen 0). CPC Plus uses
 // 12-bit 0x0VBR pairs (low = B|R<<4, high = V).
-// Falls back silently to the default palette if the block is absent or
-// implausible.
-func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) {
+//
+// Returns true when a usable palette was applied. An absent, implausible or
+// ALL-ZERO block returns false and leaves the default palette set by
+// render.NewBitmapCpcWithParams in place. An all-zero block means no palette is
+// stored: that is the case for screens whose palette is kept in a separate file
+// and for a screen unpacked from a PKS packed without --palette. Accepting it
+// would paint every pen with ink 0, i.e. a solid black image.
+func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) bool {
 	if modeOffset+17 > len(screenData) {
-		return
+		return false
 	}
 	modeByte := screenData[modeOffset]
 
@@ -926,7 +932,10 @@ func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) {
 		// CPC Plus: 33-byte block; each pen is a low/high byte pair encoding
 		// 0x0VBR (as written by fileio.SaveSCR: low = B | R<<4, high = V).
 		if modeOffset+33 > len(screenData) {
-			return
+			return false
+		}
+		if !anyNonZero(screenData[modeOffset+1 : modeOffset+33]) {
+			return false // all-zero Plus block: no palette stored
 		}
 		bmp.CpcPlus = true
 		for i := 0; i < 16; i++ {
@@ -939,19 +948,22 @@ func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) {
 			bmp.Palette[i] = int(hi&0x0F)<<8 | int(lo&0x0F)<<4 | int((lo>>4)&0x0F)
 		}
 		bmp.VirtualMode = int(modeByte) & 0x03
-		return
+		return true
 	}
 
 	// Classic: 17-byte block; inks 0..26 or 0xFF (unused pen). Only accept a
-	// plausible ModePal (mode 0..4, all inks valid) to avoid misreading pixel
-	// data as a palette.
+	// plausible ModePal (mode 0..4, all inks valid and not all zero) to avoid
+	// misreading pixel data or a stripped block as a palette.
 	if int(modeByte) > 4 {
-		return
+		return false
+	}
+	if !anyNonZero(screenData[modeOffset : modeOffset+17]) {
+		return false
 	}
 	for i := 0; i < 16; i++ {
 		b := screenData[modeOffset+1+i]
 		if b != 0xFF && b > 26 {
-			return
+			return false
 		}
 	}
 	bmp.VirtualMode = int(modeByte)
@@ -962,6 +974,7 @@ func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) {
 		}
 		bmp.Palette[i] = ink
 	}
+	return true
 }
 
 // rgbaToIndexed converts a rendered RGBA frame into an indexed-color image
@@ -1017,8 +1030,9 @@ func nearestPalIndex(palRGB []int, rgb int) uint8 {
 
 // convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
 // This is the reverse direction of the normal convert command: input is .SCR,
-// output is .PNG.
-func convertSCRToPNG(inputFile, outputFile string) error {
+// output is .PNG. warn receives a warning when the screen carries no usable
+// ModePal block and the render falls back to the default CPC palette.
+func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
 	data, err := os.ReadFile(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
@@ -1066,8 +1080,12 @@ func convertSCRToPNG(inputFile, outputFile string) error {
 	}
 
 	// Use the palette embedded in the SCR (ModePal block) instead of the
-	// fixed default palette returned by LoadSCR.
-	applySCRPalette(bmp, screenData, modeOffset)
+	// fixed default palette returned by LoadSCR. When there is no usable
+	// block the default palette is a guess, not the screen's real one: say so
+	// instead of silently rendering a solid block.
+	if !applySCRPalette(bmp, screenData, modeOffset) && warn != nil {
+		fmt.Fprintln(warn, "Warning: screen has no usable ModePal; rendering with the default CPC palette")
+	}
 
 	img := bmp.RenderToRGBA()
 	if img == nil {

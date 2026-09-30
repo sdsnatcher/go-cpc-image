@@ -682,3 +682,71 @@ func TestCLIConvertRejectsPKSInput(t *testing.T) {
 		})
 	}
 }
+
+// TestCLIConvertPaletteLessScreenWarns verifies that a screen whose ModePal block
+// is all zero — for example a screen shipped without an embedded palette, which
+// keeps it in a separate .pal file, or one unpacked from a PKS packed without
+// --palette — warns on stderr and renders with the default CPC palette instead
+// of collapsing to a solid block (every pen was ink 0 before the fix). A screen
+// carrying a usable embedded palette must stay silent.
+func TestCLIConvertPaletteLessScreenWarns(t *testing.T) {
+	cases := []struct {
+		name     string
+		embed    []byte // nil leaves the ModePal block all zero
+		wantWarn bool
+	}{
+		{"stripped block", nil, true},
+		{"embedded palette", []byte{1, 0, 1, 2, 3, 6, 9, 10, 11, 12, 15, 18, 19, 20, 24, 25, 26}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+
+			screen := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+			if tc.embed != nil {
+				screen = cpc.EmbedModePal(screen, tc.embed)
+			}
+			inPath := filepath.Join(tempDir, "screen.scr")
+			if err := os.WriteFile(inPath, screen, 0644); err != nil {
+				t.Fatalf("write screen failed: %v", err)
+			}
+
+			var stderr bytes.Buffer
+			rootCmd.SetErr(&stderr)
+			defer rootCmd.SetErr(os.Stderr)
+
+			outPath := filepath.Join(tempDir, "screen.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert SCR -> PNG failed: %v", err)
+			}
+
+			if got := strings.Contains(stderr.String(), "no usable ModePal"); got != tc.wantWarn {
+				t.Errorf("warning emitted = %v, want %v (stderr: %q)", got, tc.wantWarn, stderr.String())
+			}
+
+			f, err := os.Open(outPath)
+			if err != nil {
+				t.Fatalf("open PNG failed: %v", err)
+			}
+			defer f.Close()
+			img, _, derr := image.Decode(f)
+			if derr != nil {
+				t.Fatalf("PNG failed to decode: %v", derr)
+			}
+
+			// The rendered image must not collapse to a single colour: the
+			// default palette keeps the pens distinct.
+			seen := make(map[color.RGBA]bool)
+			for y := 0; y < img.Bounds().Dy(); y++ {
+				for x := 0; x < img.Bounds().Dx(); x++ {
+					seen[color.RGBAModel.Convert(img.At(x, y)).(color.RGBA)] = true
+				}
+			}
+			if len(seen) < 2 {
+				t.Errorf("rendered image has %d distinct colour(s); a stripped block must not render as one flat colour", len(seen))
+			}
+		})
+	}
+}
