@@ -76,7 +76,7 @@ cpc-image pack -i data.bin -o data.zx0 --method zx0
 - `zx0v2` - ZX0 version 2
 - `zx1` - ZX1 optimal compression
 - `lzw` - LZW compression
-- `pks` - PKS packed screen (default variant, PKSL)
+- `pks` - PKS packed screen, variant auto-detected from the input screen
 - `pksl` - PKS 320x200 standard (classic palette)
 - `pks3` - PKS 320x200 mode 3
 - `pksp` - PKS 320x200 CPC Plus
@@ -97,7 +97,19 @@ cpc-image pack -i screen.scr -o screen.pks --method pksl
 
 # ...or embed the palette from an external .pal file instead
 cpc-image pack -i screen.scr -o screen.pks --method pksl --palette screen.pal
+
+# Let pack pick the variant from the screen itself
+cpc-image pack -i screen.scr -o screen.pks --method pks
 ```
+
+**PKS variant auto-detection (`--method pks`):** the variant comes from the input
+screen: an overscan dump (AMSDOS load address `&0200`, or a payload of a full 16K
+bank) selects `PKVL`/`PKVP`, the `0x80` bit of the mode byte at `&17D0` (`&600`
+for overscan) marks a CPC Plus screen (`PKSP`/`PKVP`), mode 3 combined with a
+valid ModePal selects `PKS3`, and anything else stays `PKSL`. `-v` prints the
+signals that were read, and a warning is printed when none were found at all.
+Naming a variant explicitly (`--method pksl`, `--method pksp`, …) skips the
+detection.
 
 **PKS palettes:** `PKSL` embeds a 17-byte ModePal (mode + 16 inks). By default
 `pack` takes it from the input screen's own ModePal at `&17D0`; `--palette`

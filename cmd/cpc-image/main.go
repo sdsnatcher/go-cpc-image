@@ -414,6 +414,10 @@ func runPack(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Compressing %s to %s using %s\n", inputFile, outputFile, compressionMethod)
 	}
 
+	// Auto-detected PKS variant (--method pks) tracked for the summary output.
+	var pksAutoDetected bool
+	var pksAutoVariant compress.PKSVariant
+
 	// Read input file
 	inputData, err := os.ReadFile(inputFile)
 	if err != nil {
@@ -461,6 +465,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 	switch compressionMethod {
 	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp":
 		var variant compress.PKSVariant
+		autoDetected := false
 		switch compressionMethod {
 		case "pksl":
 			variant = compress.PKSL
@@ -472,17 +477,47 @@ func runPack(cmd *cobra.Command, args []string) error {
 			variant = compress.PKVL
 		case "pkvp":
 			variant = compress.PKVP
-		default:
-			// "pks" with no explicit variant packs as PKSL (320x200 standard).
-			variant = compress.PKSL
+		case "pks":
+			// --method pks auto-detects the PK* variant from the input screen.
+			autoDetected = true
 		}
 
-		// Strip a valid AMSDOS header: only the bitmap is compressed.
+		// Strip a valid AMSDOS header: only the bitmap is compressed. The load
+		// address separates an overscan dump (#0200) from a standard one.
 		bitmap := inputData
+		amsAddr := uint16(0)
 		if len(inputData) >= 128 && cpc.CheckAmsdos(inputData) {
 			bitmap = inputData[128:]
+			if ent, e := cpc.GetAmsdos(inputData); e == nil {
+				amsAddr = ent.Address
+			}
 			if verbose {
 				fmt.Println("AMSDOS header detected; packing bitmap payload only")
+			}
+		}
+
+		// Auto-detect the PK* variant when the user asked for --method pks.
+		var confidence int
+		if autoDetected {
+			variant, confidence = detectPKSVariant(bitmap, amsAddr)
+			pksAutoDetected = true
+			pksAutoVariant = variant
+			if verbose {
+				overscan, modeByte, _ := pksVariantSignals(bitmap, amsAddr)
+				ovsFlag, plusFlag := 0, 0
+				if overscan {
+					ovsFlag = 1
+				}
+				if (modeByte & 0x80) != 0 {
+					plusFlag = 1
+				}
+				fmt.Printf("auto: overscan=%d modePal=0x%02X plus=%d confidence=%d -> %s\n",
+					ovsFlag, modeByte, plusFlag, confidence, pksVariantName(variant))
+				if confidence == 0 {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARNING: no PKS variant signals found in input; falling back to %s\n",
+						pksVariantName(variant))
+				}
 			}
 		}
 
@@ -583,6 +618,9 @@ func runPack(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Input: %s (%d bytes)\n", inputFile, inputSize)
 	fmt.Printf("  Output: %s (%d bytes)\n", outputFile, outputSize)
 	fmt.Printf("  Method: %s\n", compressionMethod)
+	if pksAutoDetected {
+		fmt.Printf("  Variant: %s (auto-detected)\n", pksVariantName(pksAutoVariant))
+	}
 	fmt.Printf("  Compression ratio: %.1f%%\n", compressionRatio)
 	fmt.Printf("  Space saved: %d bytes (%.1f%%)\n",
 		inputSize-outputSize, 100.0-compressionRatio)
@@ -744,6 +782,56 @@ func anyNonZero(b []byte) bool {
 		}
 	}
 	return false
+}
+
+// pksVariantSignals reads the signals `pack --method pks` keys on: overscan
+// (AMSDOS load address 0x0200, or a payload of a full 16K bank) and the mode
+// byte at 0x17D0 (standard) / 0x600 (overscan), whose 0x80 bit marks a CPC Plus
+// screen. haveMode is false when the dump is too short to hold that byte.
+func pksVariantSignals(bitmap []byte, amsAddr uint16) (overscan bool, modeByte byte, haveMode bool) {
+	overscan = (amsAddr == 0x0200) || (amsAddr == 0 && len(bitmap) >= 0x4000)
+	modeOffset := cpc.ModePalOffset // 0x17D0
+	if overscan {
+		modeOffset = 0x600
+	}
+	if modeOffset < len(bitmap) {
+		return overscan, bitmap[modeOffset], true
+	}
+	return overscan, 0, false
+}
+
+// detectPKSVariant picks the PK* variant for `pack --method pks` from the screen
+// itself: overscan + CPC Plus → PKVP, overscan → PKVL, Plus → PKSP, mode 3 with
+// a validated ModePal → PKS3, anything else → PKSL.
+//
+// The confidence is 0 when no mode byte was available at all (PKSL/PKVL is then
+// a fallback rather than a reading), 1 when the mode byte was read, and 2 for
+// the mode-3 case, which is only taken with the whole 17-byte block validated.
+func detectPKSVariant(bitmap []byte, amsAddr uint16) (compress.PKSVariant, int) {
+	overscan, modeByte, haveMode := pksVariantSignals(bitmap, amsAddr)
+
+	confidence := 0
+	if haveMode {
+		confidence = 1
+	}
+	cpcPlus := (modeByte & 0x80) != 0
+	mode := int(modeByte & 0x7F)
+
+	if overscan && cpcPlus {
+		return compress.PKVP, confidence
+	}
+	if overscan {
+		return compress.PKVL, confidence
+	}
+	if cpcPlus {
+		return compress.PKSP, confidence
+	}
+	// Mode 3 is only chosen when there is certainty: the byte at 0x17D0 is 3
+	// AND the whole 17-byte block validates as a ModePal.
+	if mode == 3 && cpc.ExtractModePal(bitmap) != nil {
+		return compress.PKS3, 2
+	}
+	return compress.PKSL, confidence
 }
 
 // pksVariantName returns a human-readable name for a PKS variant.

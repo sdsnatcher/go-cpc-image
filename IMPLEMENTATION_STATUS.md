@@ -33,6 +33,10 @@
   pks3, pksp, pkvl, pkvp)
 - **PKS palette embedding:** `--palette <file.pal>` overrides the ModePal found
   in the input screen (PKSL only; other variants ignore it with a warning)
+- **PKS variant auto-detection:** `--method pks` picks the variant from the input
+  screen (overscan load address `&0200` or a 16K payload → `PKVL`/`PKVP`; the
+  `0x80` bit of the mode byte at `&17D0`/`&600` → `PKSP`/`PKVP`; mode 3 with a
+  valid ModePal → `PKS3`; otherwise `PKSL`), and reports the choice in the summary
 - **Compression ratio reporting**
 - **File size statistics**
 - **Rejects already-compressed input** (PKS/OCP signatures and the compressed

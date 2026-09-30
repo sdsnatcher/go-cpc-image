@@ -750,3 +750,144 @@ func TestCLIConvertPaletteLessScreenWarns(t *testing.T) {
 		})
 	}
 }
+
+// TestCLIPackAutoDetectPKSVariant verifies that `pack --method pks` derives the
+// PK* variant from the input screen instead of always writing PKSL: an overscan
+// dump (AMSDOS load address 0x0200, or a payload of a full 16K bank) and a CPC
+// Plus screen (0x80 bit in the mode byte at 0x17D0 / 0x600) select PKVL, PKVP and
+// PKSP, mode 3 selects PKS3 only when the whole ModePal block validates, and
+// anything else stays PKSL.
+func TestCLIPackAutoDetectPKSVariant(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// --palette binds a process-global: clear whatever an earlier Execute() in
+	// this package left behind.
+	if err := packCmd.Flags().Set("palette", ""); err != nil {
+		t.Fatalf("reset --palette failed: %v", err)
+	}
+
+	stdSize := cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+	ovsSize := cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines)
+
+	// modeByteAt returns a raw screen dump with modeByte written at off.
+	modeByteAt := func(size, off int, modeByte byte) []byte {
+		bmp := mkRawSCR(size)
+		if off < len(bmp) {
+			bmp[off] = modeByte
+		}
+		return bmp
+	}
+	// mode3Screen carries a full, valid ModePal (mode 3 + valid ink indices).
+	mode3Screen := func() []byte {
+		pal := make([]byte, 17)
+		pal[0] = 3
+		for i := 1; i < 17; i++ {
+			pal[i] = byte(i)
+		}
+		return cpc.EmbedModePal(mkRawSCR(stdSize), pal)
+	}
+	// amsdos wraps payload in an AMSDOS header that loads at addr.
+	amsdos := func(t *testing.T, payload []byte, addr uint16) []byte {
+		t.Helper()
+		ent := cpc.CreeEntete("screen.scr", addr, uint16(len(payload)), 0xC7D0)
+		hdr, err := cpc.AmsdosToByte(ent)
+		if err != nil {
+			t.Fatalf("AmsdosToByte failed: %v", err)
+		}
+		return append(hdr, payload...)
+	}
+
+	cases := []struct {
+		name string
+		data func(*testing.T) []byte
+		want compress.PKSVariant
+	}{
+		{"std classic mode 0", func(*testing.T) []byte {
+			return modeByteAt(stdSize, cpc.ModePalOffset, 0x00)
+		}, compress.PKSL},
+		{"std classic mode 1", func(*testing.T) []byte {
+			return modeByteAt(stdSize, cpc.ModePalOffset, 0x01)
+		}, compress.PKSL},
+		{"std mode 3 byte without valid ModePal", func(*testing.T) []byte {
+			bmp := modeByteAt(stdSize, cpc.ModePalOffset, 0x03)
+			bmp[cpc.ModePalOffset+1] = 0x40 // ink index > 26: the block is not a ModePal
+			return bmp
+		}, compress.PKSL},
+		{"std mode 3 with valid ModePal", func(*testing.T) []byte {
+			return mode3Screen()
+		}, compress.PKS3},
+		{"std Plus mode 1", func(*testing.T) []byte {
+			return modeByteAt(stdSize, cpc.ModePalOffset, 0x81)
+		}, compress.PKSP},
+		{"std Plus mode 3", func(*testing.T) []byte {
+			return modeByteAt(stdSize, cpc.ModePalOffset, 0x8F)
+		}, compress.PKSP},
+		{"ovs classic 16K payload", func(*testing.T) []byte {
+			return modeByteAt(ovsSize, 0x600, 0x01)
+		}, compress.PKVL},
+		{"ovs Plus 16K payload", func(*testing.T) []byte {
+			return modeByteAt(ovsSize, 0x600, 0x8D)
+		}, compress.PKVP},
+		{"std payload with AMSDOS 0x0200", func(t *testing.T) []byte {
+			return amsdos(t, modeByteAt(stdSize, 0x600, 0x01), 0x0200)
+		}, compress.PKVL},
+		{"std payload with AMSDOS 0x0200 Plus", func(t *testing.T) []byte {
+			return amsdos(t, modeByteAt(stdSize, 0x600, 0x8D), 0x0200)
+		}, compress.PKVP},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := strings.ReplaceAll(tc.name, " ", "_")
+			inPath := filepath.Join(tempDir, base+".bin")
+			if err := os.WriteFile(inPath, tc.data(t), 0644); err != nil {
+				t.Fatalf("write fixture failed: %v", err)
+			}
+
+			outPath := filepath.Join(tempDir, base+".pks")
+			rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", outPath, "--method", "pks"})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack failed: %v", err)
+			}
+
+			header, err := compress.ParsePKSHeader(mustRead(t, outPath)[128:])
+			if err != nil {
+				t.Fatalf("ParsePKSHeader failed: %v", err)
+			}
+			if header.Variant != tc.want {
+				t.Errorf("auto-detected variant = %s, want %s",
+					pksVariantName(header.Variant), pksVariantName(tc.want))
+			}
+		})
+	}
+
+	// No signal at all: a dump too short to hold the mode byte falls back to
+	// PKSL and says so (verbose warning, on stderr).
+	t.Run("no signal falls back to PKSL", func(t *testing.T) {
+		inPath := filepath.Join(tempDir, "tiny.bin")
+		if err := os.WriteFile(inPath, make([]byte, 1024), 0644); err != nil {
+			t.Fatalf("write fixture failed: %v", err)
+		}
+
+		var stderr bytes.Buffer
+		rootCmd.SetErr(&stderr)
+		defer rootCmd.SetErr(os.Stderr)
+
+		outPath := filepath.Join(tempDir, "tiny.pks")
+		rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", outPath, "--method", "pks", "-v"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("pack failed: %v", err)
+		}
+
+		header, err := compress.ParsePKSHeader(mustRead(t, outPath)[128:])
+		if err != nil {
+			t.Fatalf("ParsePKSHeader failed: %v", err)
+		}
+		if header.Variant != compress.PKSL {
+			t.Errorf("fallback variant = %s, want PKSL", pksVariantName(header.Variant))
+		}
+		if !strings.Contains(stderr.String(), "falling back to PKSL") {
+			t.Errorf("expected a fallback warning on stderr, got: %q", stderr.String())
+		}
+	})
+}
