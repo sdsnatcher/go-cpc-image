@@ -556,7 +556,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 		// variants compress the screen dump as it is.
 		packInput := bitmap
 		if variant == compress.PKSL {
-			packInput = cpc.ScreenToColumnMajor(bitmap)
+			packInput = cpc.ScreenToColumnMajor(bitmap, cpc.StandardCols, cpc.StandardLines)
 		}
 
 		pksBuf := make([]byte, len(packInput)*2+1024)
@@ -731,7 +731,7 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 		// CPC screen layout and re-embed the ModePal so the restored .SCR is
 		// self-describing, as the original screens are.
 		if header != nil && header.Variant == compress.PKSL {
-			screen := cpc.ColumnMajorToScreen(depacked[:outputSize])
+			screen := cpc.ColumnMajorToScreen(depacked[:outputSize], cpc.StandardCols, cpc.StandardLines)
 			if anyNonZero(header.Palette[:]) {
 				screen = cpc.EmbedModePal(screen, header.Palette[:])
 			}

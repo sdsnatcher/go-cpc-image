@@ -34,8 +34,17 @@ const (
 	OverscanLines = 272 // 272 lines * 2 pixels = 544 pixels high
 )
 
+// Underscan screen represents underscan CPC screen dimensions: 64 bytes per
+// line (512 pixels wide in mode 0, 256 in mode 1, 512 in mode 2) at half the
+// height of a standard screen.
+const (
+	UnderscanCols  = 64  // 64 columns * 8 pixels = 512 pixels wide
+	UnderscanLines = 192 // 192 lines * 2 pixels = 384 pixels high
+)
+
 // ModePalOffset is the offset of the embedded ModePal block in a standard SCR
-// (mode byte + 16 ink values). Overscan dumps carry it at 0x600 instead.
+// (mode byte + 16 ink values). Overscan dumps carry it at 0x600 instead;
+// underscan dumps keep it here, exactly like standard ones.
 const ModePalOffset = 0x17D0
 
 // ScreenConfig holds the current screen configuration
@@ -59,6 +68,15 @@ func NewOverscanScreen() ScreenConfig {
 	return ScreenConfig{
 		NumCol: OverscanCols,
 		NumLig: OverscanLines,
+		YEgx:   0,
+	}
+}
+
+// NewUnderscanScreen returns an underscan CPC screen configuration
+func NewUnderscanScreen() ScreenConfig {
+	return ScreenConfig{
+		NumCol: UnderscanCols,
+		NumLig: UnderscanLines,
 		YEgx:   0,
 	}
 }
@@ -98,22 +116,27 @@ func (s ScreenConfig) GetBitmapSize() int {
 // code and the ModePal live.
 const PKSLPixelBytes = StandardCols * StandardLines
 
-// ScreenToColumnMajor extracts the 16000 pixel bytes of a standard CPC screen
-// dump in the column-major order used by the PKSL format:
+// UnderscanPixelBytes is the pixel-only size of an underscan screen: 64 columns
+// × 192 lines = 12288 bytes, excluding the same layout gaps.
+const UnderscanPixelBytes = UnderscanCols * UnderscanLines
+
+// ScreenToColumnMajor extracts the pixel bytes of a CPC screen dump in the
+// column-major order used by the PKSL/PKUL formats (numCol×numLig bytes: 16000
+// for a standard screen, 12288 for an underscan one):
 //
-//	for x := 0; x < 80; x++ {
-//	  for y := 0; y < 200; y++ {
-//	    out = append(out, bmp[x + CpcAddress(y*2, 80, 200)])
+//	for x := 0; x < numCol; x++ {
+//	  for y := 0; y < numLig; y++ {
+//	    out = append(out, bmp[x + CpcAddress(y*2, numCol, numLig)])
 //	  }
 //	}
 //
 // bmp must cover the pixel addresses; missing bytes are treated as zero.
-func ScreenToColumnMajor(bmp []byte) []byte {
-	out := make([]byte, PKSLPixelBytes)
+func ScreenToColumnMajor(bmp []byte, numCol, numLig int) []byte {
+	out := make([]byte, numCol*numLig)
 	i := 0
-	for x := 0; x < StandardCols; x++ {
-		for y := 0; y < StandardLines; y++ {
-			adr := x + CpcAddress(y<<1, StandardCols, StandardLines)
+	for x := 0; x < numCol; x++ {
+		for y := 0; y < numLig; y++ {
+			adr := x + CpcAddress(y<<1, numCol, numLig)
 			if adr < len(bmp) {
 				out[i] = bmp[adr]
 			}
@@ -123,20 +146,20 @@ func ScreenToColumnMajor(bmp []byte) []byte {
 	return out
 }
 
-// ColumnMajorToScreen scatters a 16000-byte column-major PKSL payload back into
-// a standard CPC screen dump (BitmapSize(StandardCols, StandardLines) bytes).
+// ColumnMajorToScreen scatters a column-major pixel payload back into a CPC
+// screen dump of BitmapSize(numCol, numLig) bytes.
 // Gaps between pixel regions (where the display code / ModePal live) are left
 // zeroed.
-func ColumnMajorToScreen(data []byte) []byte {
-	size := BitmapSize(StandardCols, StandardLines)
+func ColumnMajorToScreen(data []byte, numCol, numLig int) []byte {
+	size := BitmapSize(numCol, numLig)
 	out := make([]byte, size)
 	i := 0
-	for x := 0; x < StandardCols; x++ {
-		for y := 0; y < StandardLines; y++ {
+	for x := 0; x < numCol; x++ {
+		for y := 0; y < numLig; y++ {
 			if i >= len(data) {
 				return out
 			}
-			adr := x + CpcAddress(y<<1, StandardCols, StandardLines)
+			adr := x + CpcAddress(y<<1, numCol, numLig)
 			if adr < len(out) {
 				out[adr] = data[i]
 			}

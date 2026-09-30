@@ -285,7 +285,8 @@ func TestCLIPackAndUnpackPKS(t *testing.T) {
 
 			restored := mustRead(t, unpackedPath)
 			if tc.isPKSL {
-				if !bytes.Equal(cpc.ScreenToColumnMajor(restored), cpc.ScreenToColumnMajor(testData)) {
+				if !bytes.Equal(cpc.ScreenToColumnMajor(restored, cpc.StandardCols, cpc.StandardLines),
+					cpc.ScreenToColumnMajor(testData, cpc.StandardCols, cpc.StandardLines)) {
 					t.Error("PKSL pixel data mismatch after round-trip")
 				}
 			} else if !bytes.Equal(restored, testData) {
