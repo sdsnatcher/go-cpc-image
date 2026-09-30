@@ -26,6 +26,9 @@ const (
 	MethodPKSP // PKS 320x200 Plus
 	MethodPKVL // PKS overscan standard
 	MethodPKVP // PKS overscan Plus
+	MethodPKUL // PKS underscan standard
+	MethodPKU3 // PKS underscan mode 3
+	MethodPKUP // PKS underscan Plus
 )
 
 // LZW represents the LZW compression/decompression engine
