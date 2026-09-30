@@ -82,6 +82,9 @@ cpc-image pack -i data.bin -o data.zx0 --method zx0
 - `pksp` - PKS 320x200 CPC Plus
 - `pkvl` - PKS overscan standard
 - `pkvp` - PKS overscan CPC Plus
+- `pkul` - PKS underscan standard
+- `pku3` - PKS underscan mode 3
+- `pkup` - PKS underscan CPC Plus
 
 **Examples:**
 ```bash
@@ -104,19 +107,22 @@ cpc-image pack -i screen.scr -o screen.pks --method pks
 
 **PKS variant auto-detection (`--method pks`):** the variant comes from the input
 screen: an overscan dump (AMSDOS load address `&0200`, or a payload of a full 16K
-bank) selects `PKVL`/`PKVP`, the `0x80` bit of the mode byte at `&17D0` (`&600`
-for overscan) marks a CPC Plus screen (`PKSP`/`PKVP`), mode 3 combined with a
-valid ModePal selects `PKS3`, and anything else stays `PKSL`. `-v` prints the
-signals that were read, and a warning is printed when none were found at all.
-Naming a variant explicitly (`--method pksl`, `--method pksp`, …) skips the
-detection.
+bank) selects `PKVL`/`PKVP`, an underscan dump (a `&3E00` payload, i.e. the
+64x192 screen) selects `PKUL`/`PKU3`/`PKUP`, the `0x80` bit of the mode byte at
+`&17D0` (`&600` for overscan) marks a CPC Plus screen (`PKSP`/`PKVP`/`PKUP`), mode
+3 combined with a valid ModePal selects `PKS3`/`PKU3`, and anything else stays
+`PKSL`. `-v` prints the signals that were read, and a warning is printed when
+none were found at all. Naming a variant explicitly (`--method pksl`, …) skips
+the detection.
 
-**PKS palettes:** `PKSL` embeds a 17-byte ModePal (mode + 16 inks). By default
-`pack` takes it from the input screen's own ModePal at `&17D0`; `--palette`
-overrides it. The other variants (`pks3`, `pksp`, `pkvl`, `pkvp`) carry no
-palette, so the flag is ignored with a warning. When the screen has no usable
-(non-empty) ModePal and no `--palette` is given, the header keeps an empty
-palette and a warning is printed.
+**PKS palettes:** `PKSL` and `PKUL` embed a 17-byte ModePal (mode + 16 inks). By
+default `pack` takes it from the input screen's own ModePal at `&17D0`;
+`--palette` overrides it. `PKUP` has the same 17-byte field — its data starts at
+the same offset — but a CPC Plus palette does not fit there: it stays in the
+packed screen itself, so the field is empty. The other variants (`pks3`, `pksp`,
+`pkvl`, `pkvp`, `pku3`) carry no palette, so the flag is ignored with a warning.
+When the screen has no usable (non-empty) ModePal and no `--palette` is given,
+the header keeps an empty palette and a warning is printed.
 
 **Rejecting already-compressed input:** `pack` refuses to re-compress data that
 is already compressed and exits with a **non-zero code** so scripts can react.
@@ -147,10 +153,11 @@ cpc-image unpack -i screen.pks -o screen.scr
 ```
 
 **PKS family (`PK` payloads):** decompressed transparently, whichever variant
-the signature names. For `PKSL` the payload is column-major pixel data: it is
-scattered back into the CPC screen layout and the embedded ModePal is
+the signature names. For `PKSL` and `PKUL` the payload is column-major pixel
+data: it is scattered back into the CPC screen layout and the embedded ModePal is
 re-written at `&17D0`, so the restored `.SCR` is self-describing, like the
-original screens. `PKVL` / `PKVP` (overscan) and the other variants emit the
+original screens — `PKUL` screens end at `&3E00` bytes (64x192) instead of the
+standard `&3FD0`. `PKVL` / `PKVP` (overscan) and the other variants emit the
 payload as it is.
 
 **Rejecting raw (uncompressed) SCR input:** in auto-detect mode, `unpack` refuses

@@ -779,14 +779,15 @@ func TestCLIPackAutoDetectPKSVariant(t *testing.T) {
 		return bmp
 	}
 	// mode3Screen carries a full, valid ModePal (mode 3 + valid ink indices).
-	mode3Screen := func() []byte {
+	mode3Screen := func(size int) []byte {
 		pal := make([]byte, 17)
 		pal[0] = 3
 		for i := 1; i < 17; i++ {
 			pal[i] = byte(i)
 		}
-		return cpc.EmbedModePal(mkRawSCR(stdSize), pal)
+		return cpc.EmbedModePal(mkRawSCR(size), pal)
 	}
+	underSize := cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines)
 	// amsdos wraps payload in an AMSDOS header that loads at addr.
 	amsdos := func(t *testing.T, payload []byte, addr uint16) []byte {
 		t.Helper()
@@ -815,8 +816,17 @@ func TestCLIPackAutoDetectPKSVariant(t *testing.T) {
 			return bmp
 		}, compress.PKSL},
 		{"std mode 3 with valid ModePal", func(*testing.T) []byte {
-			return mode3Screen()
+			return mode3Screen(stdSize)
 		}, compress.PKS3},
+		{"underscan classic", func(*testing.T) []byte {
+			return modeByteAt(underSize, cpc.ModePalOffset, 0x01)
+		}, compress.PKUL},
+		{"underscan Plus", func(*testing.T) []byte {
+			return modeByteAt(underSize, cpc.ModePalOffset, 0x8D)
+		}, compress.PKUP},
+		{"underscan mode 3 with valid ModePal", func(*testing.T) []byte {
+			return mode3Screen(underSize)
+		}, compress.PKU3},
 		{"std Plus mode 1", func(*testing.T) []byte {
 			return modeByteAt(stdSize, cpc.ModePalOffset, 0x81)
 		}, compress.PKSP},
@@ -893,12 +903,170 @@ func TestCLIPackAutoDetectPKSVariant(t *testing.T) {
 	})
 }
 
-// corpusPath returns the path of a read-only sample in the reference sample
-// tree, skipping the test when that tree is not checked out (it is not part of
-// this repository).
+// TestCLIPackUnderscanVariantsRoundTrip verifies the underscan variants through
+// the CLI: pack emits PKUL/PKU3/PKUP for an underscan screen (it must not fall
+// back to PKSL) and unpack restores it — column-major pixels plus the ModePal
+// for PKUL, the dump as it is for the others.
+func TestCLIPackUnderscanVariantsRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	underscanSize := cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines)
+
+	classicPal := []byte{1, 0, 1, 2, 3, 6, 9, 10, 11, 12, 15, 18, 19, 20, 24, 25, 26}
+	screen := cpc.EmbedModePal(mkRawSCR(underscanSize), classicPal)
+	inPath := filepath.Join(tempDir, "underscan.bin")
+	if err := os.WriteFile(inPath, screen, 0644); err != nil {
+		t.Fatalf("write fixture failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		method  string
+		variant compress.PKSVariant
+	}{
+		{"PKUL", "pkul", compress.PKUL},
+		{"PKU3", "pku3", compress.PKU3},
+		{"PKUP", "pkup", compress.PKUP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			packedPath := filepath.Join(tempDir, tc.name+".pks")
+			unpackedPath := filepath.Join(tempDir, tc.name+"_restored.bin")
+
+			rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", packedPath, "--method", tc.method})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack failed: %v", err)
+			}
+			header, err := compress.ParsePKSHeader(mustRead(t, packedPath)[128:])
+			if err != nil {
+				t.Fatalf("ParsePKSHeader failed: %v", err)
+			}
+			if header.Variant != tc.variant {
+				t.Errorf("variant = %s, want %s", pksVariantName(header.Variant), pksVariantName(tc.variant))
+			}
+
+			rootCmd.SetArgs([]string{"unpack", "-i", packedPath, "-o", unpackedPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("unpack failed: %v", err)
+			}
+			restored := mustRead(t, unpackedPath)
+			if len(restored) != underscanSize {
+				t.Fatalf("restored size = %d, want %d", len(restored), underscanSize)
+			}
+
+			if tc.variant == compress.PKUL {
+				// Pixel data only survives, compared in the payload layout.
+				if !bytes.Equal(cpc.ScreenToColumnMajor(restored, cpc.StandardCols, cpc.StandardLines),
+					cpc.ScreenToColumnMajor(screen, cpc.StandardCols, cpc.StandardLines)) {
+					t.Error("PKUL pixel data mismatch after round-trip")
+				}
+				got := restored[cpc.ModePalOffset : cpc.ModePalOffset+17]
+				if !bytes.Equal(got, classicPal) {
+					t.Errorf("PKUL ModePal = % x, want % x", got, classicPal)
+				}
+			} else if !bytes.Equal(restored, screen) {
+				t.Error("restored dump differs from the original screen")
+			}
+		})
+	}
+}
+
+// TestCLIPackUnderscanPlusRoundTrip builds an underscan CPC Plus screen with
+// fileio.SaveSCR (33-byte Plus block at 0x17D0), packs it with --method pks and
+// checks the PKUP header, the round-trip and the rendered Plus palette.
+func TestCLIPackUnderscanPlusRoundTrip(t *testing.T) {
+	tempDir := t.TempDir()
+	underscanSize := cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines)
+
+	palette16 := make([]uint16, 16)
+	for i := range palette16 {
+		palette16[i] = uint16(i * 0x111)
+	}
+	inPath := filepath.Join(tempDir, "plus.scr")
+	params := fileio.SCRParams{WithPalette: true, WithCode: true, CPCPlus: true, VirtualMode: 1}
+	if _, err := fileio.SaveSCR(inPath, mkRawSCR(underscanSize), underscanSize,
+		fileio.PackNone, fileio.OutputBinary, params, palette16, nil); err != nil {
+		t.Fatalf("SaveSCR failed: %v", err)
+	}
+	scrData := mustRead(t, inPath)
+	if scrData[0x17D0]&0x80 == 0 {
+		t.Fatalf("fixture has no Plus mode byte at 0x17D0: 0x%02X", scrData[0x17D0])
+	}
+
+	packedPath := filepath.Join(tempDir, "plus.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", packedPath, "--method", "pks"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack failed: %v", err)
+	}
+	header, err := compress.ParsePKSHeader(mustRead(t, packedPath)[128:])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	if header.Variant != compress.PKUP {
+		t.Fatalf("auto-detected variant = %s, want PKUP", pksVariantName(header.Variant))
+	}
+	if !header.CpcPlus {
+		t.Error("PKUP should report CpcPlus")
+	}
+	if header.DataOffset != 21 {
+		t.Errorf("PKUP data offset = %d, want 21 (palette field present)", header.DataOffset)
+	}
+
+	unpackedPath := filepath.Join(tempDir, "plus_restored.bin")
+	rootCmd.SetArgs([]string{"unpack", "-i", packedPath, "-o", unpackedPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack failed: %v", err)
+	}
+	if restored := mustRead(t, unpackedPath); !bytes.Equal(restored, scrData[128:]) {
+		t.Error("PKUP round-trip is not byte-for-byte")
+	}
+
+	// The restored screen must render with the Plus palette at 0x17D0.
+	backPath := filepath.Join(tempDir, "plus.png")
+	rootCmd.SetArgs([]string{"convert", "-i", unpackedPath, "-o", backPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert failed: %v", err)
+	}
+	f, err := os.Open(backPath)
+	if err != nil {
+		t.Fatalf("open PNG failed: %v", err)
+	}
+	defer f.Close()
+	img, _, derr := image.Decode(f)
+	if derr != nil {
+		t.Fatalf("PNG failed to decode: %v", derr)
+	}
+	if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
+		t.Errorf("underscan Plus PNG is %dx%d, want 512x384", got.Dx(), got.Dy())
+	}
+	paletted, ok := img.(*image.Paletted)
+	if !ok {
+		t.Fatalf("underscan Plus PNG is %T, want an indexed image", img)
+	}
+	for pen := 0; pen < 16; pen++ {
+		want := cpc.PaletteColor(int(palette16[pen]), true)
+		got := color.RGBAModel.Convert(paletted.Palette[pen]).(color.RGBA)
+		if int(got.R) != (want>>16)&0xFF || int(got.G) != (want>>8)&0xFF || int(got.B) != want&0xFF {
+			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X", pen, got.R, got.G, got.B, want)
+		}
+	}
+}
+
+// corpusSamplesEnv names the environment variable that points at a directory of
+// read-only reference screens — the corpus this PKS support was validated
+// against. Those screens are not part of this repository, so the tests that need
+// them skip unless the variable is set, e.g.
+//
+//	CPC_SAMPLES_DIR=/path/to/samples go test ./...
+const corpusSamplesEnv = "CPC_SAMPLES_DIR"
+
+// corpusPath returns the path of a reference screen, skipping the test when the
+// corpus directory is not configured or the sample is missing.
 func corpusPath(t *testing.T, rel string) string {
 	t.Helper()
-	p := filepath.Join("..", "..", "go-cpc-image-1.2.0-pks", "samples", filepath.FromSlash(rel))
+	root := os.Getenv(corpusSamplesEnv)
+	if root == "" {
+		t.Skipf("set %s to run the corpus-driven tests", corpusSamplesEnv)
+	}
+	p := filepath.Join(root, filepath.FromSlash(rel))
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("sample not available: %s", p)
 	}
@@ -954,5 +1122,204 @@ func TestCLIConvertUnderscanSCRToPNG(t *testing.T) {
 			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (ink %d)",
 				pen, got.R, got.G, got.B, want, ink)
 		}
+	}
+}
+
+// TestCLIUnpackRealPKULSamples unpacks every underscan PKUL sample that has a
+// paired raw screen and checks the restored dump: the underscan size, the pixel
+// data in the payload's column-major layout and the ModePal taken from the
+// header. The layout gaps are not compared: the raw screens keep their display
+// code there, while a restored dump has its gaps zeroed.
+func TestCLIUnpackRealPKULSamples(t *testing.T) {
+	root := os.Getenv(corpusSamplesEnv)
+	if root == "" {
+		t.Skipf("set %s to run the corpus-driven tests", corpusSamplesEnv)
+	}
+	pattern := filepath.Join(root, "mode*", "underscan_*", "pk_compressed", "*.SCR")
+	packed, err := filepath.Glob(pattern)
+	if err != nil || len(packed) == 0 {
+		t.Skipf("no underscan samples available (%s)", pattern)
+	}
+	sep := string(filepath.Separator)
+
+	checked := 0
+	for _, pk := range packed {
+		rawPath := strings.Replace(pk,
+			sep+"pk_compressed"+sep, sep+"raw"+sep, 1)
+		if _, err := os.Stat(rawPath); err != nil {
+			continue
+		}
+		name := filepath.Base(pk)
+
+		packedData := mustRead(t, pk)
+		if string(packedData[128:132]) != "PKUL" {
+			t.Fatalf("%s: signature = %q, want PKUL", name, packedData[128:132])
+		}
+		header, herr := compress.ParsePKSHeader(packedData[128:])
+		if herr != nil {
+			t.Fatalf("%s: ParsePKSHeader failed: %v", name, herr)
+		}
+		rawData := mustRead(t, rawPath)
+		rawPayload := rawData
+		if len(rawData) >= 128 && cpc.CheckAmsdos(rawData) {
+			rawPayload = rawData[128:]
+		}
+
+		outPath := filepath.Join(t.TempDir(), name)
+		rootCmd.SetArgs([]string{"unpack", "-i", pk, "-o", outPath})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("%s: unpack failed: %v", name, err)
+		}
+		restored := mustRead(t, outPath)
+		if wantSize := cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines); len(restored) != wantSize {
+			t.Fatalf("%s: restored %d bytes, want %d", name, len(restored), wantSize)
+		}
+		if !bytes.Equal(
+			cpc.ScreenToColumnMajor(restored, cpc.StandardCols, cpc.StandardLines),
+			cpc.ScreenToColumnMajor(rawPayload, cpc.StandardCols, cpc.StandardLines)) {
+			t.Errorf("%s: pixel data differs from the raw screen", name)
+		}
+		got := restored[cpc.ModePalOffset : cpc.ModePalOffset+17]
+		if !bytes.Equal(got, header.Palette[:]) {
+			t.Errorf("%s: ModePal = % x, want % x (from the PKUL header)", name, got, header.Palette[:])
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Skip("no PKUL/raw pairs available")
+	}
+	t.Logf("checked %d real PKUL samples", checked)
+}
+
+// TestCLIConvertUnderscanPlusRealSamples renders the two real underscan CPC Plus
+// screens: the geometry must be the underscan one, the palette must be decoded
+// from the 33-byte Plus block at 0x17D0 (with FF FF marking an unused pen) and
+// the PNG must be a 16-entry indexed image in pen order.
+func TestCLIConvertUnderscanPlusRealSamples(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rel      string
+		modeByte byte
+	}{
+		{"SF2CHUNL", "mode1+/underscan_256x192/raw/SF2CHUNL.SCR", 0x8D},
+		{"GEMPAINT", "mode2+/underscan_512x192/raw/GEMPAINT.SCR", 0x8E},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inPath := corpusPath(t, tc.rel)
+			raw := mustRead(t, inPath)
+			block := raw[128+cpc.ModePalOffset : 128+cpc.ModePalOffset+33]
+			if block[0] != tc.modeByte {
+				t.Fatalf("Plus mode byte = 0x%02X, want 0x%02X", block[0], tc.modeByte)
+			}
+
+			outPath := filepath.Join(t.TempDir(), "out.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert failed: %v", err)
+			}
+			f, err := os.Open(outPath)
+			if err != nil {
+				t.Fatalf("open PNG failed: %v", err)
+			}
+			defer f.Close()
+			img, _, derr := image.Decode(f)
+			if derr != nil {
+				t.Fatalf("PNG failed to decode: %v", derr)
+			}
+			if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
+				t.Errorf("PNG is %dx%d, want 512x384 (underscan code space)", got.Dx(), got.Dy())
+			}
+			paletted, ok := img.(*image.Paletted)
+			if !ok {
+				t.Fatalf("PNG is %T, want an indexed image", img)
+			}
+			if len(paletted.Palette) != 16 {
+				t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+			}
+			for pen := 0; pen < 16; pen++ {
+				lo, hi := block[1+pen*2], block[2+pen*2]
+				want := 0
+				if lo != 0xFF || hi != 0xFF { // FF FF = unused pen, read as black
+					want = int(hi&0x0F)<<8 | int(lo&0x0F)<<4 | int((lo>>4)&0x0F)
+				}
+				wantRGB := cpc.PaletteColor(want, true)
+				got := color.RGBAModel.Convert(paletted.Palette[pen]).(color.RGBA)
+				if int(got.R) != (wantRGB>>16)&0xFF || int(got.G) != (wantRGB>>8)&0xFF || int(got.B) != wantRGB&0xFF {
+					t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (0x0VBR 0x%03X)",
+						pen, got.R, got.G, got.B, wantRGB, want)
+				}
+			}
+		})
+	}
+}
+
+// TestCLIConvertPlusPaletteRealSamples pins the palette decoded from the real
+// CPC Plus screens — standard and overscan, the 33-byte block at 0x17D0 or 0x600
+// — against the values measured from those files, so a change in the shared
+// decoder is caught immediately.
+func TestCLIConvertPlusPaletteRealSamples(t *testing.T) {
+	cases := []struct {
+		name     string
+		rel      string
+		offset   int
+		modeByte byte
+		want     [16]uint16
+	}{
+		{"DEMO1", "mode0+/standard_160x200/raw/DEMO1.SCR", cpc.ModePalOffset, 0x8C,
+			[16]uint16{0x000, 0x4F2, 0x8D4, 0x050, 0x999, 0x008, 0x444, 0x0B0, 0x50E, 0xEEE, 0x10D, 0x400, 0x700, 0x90E, 0xF0F, 0x000}},
+		{"DEMO2", "mode0+/standard_160x200/raw/DEMO2.SCR", cpc.ModePalOffset, 0x8C,
+			[16]uint16{0x020, 0x000, 0x050, 0x50E, 0x10D, 0x90E, 0x008, 0xEEE, 0x400, 0x700, 0xF0F, 0x0B0, 0x999, 0x4F2, 0x444, 0x8D4}},
+		{"SPACE", "mode0+/standard_160x200/raw/SPACE.SCR", cpc.ModePalOffset, 0x8C,
+			[16]uint16{0x000, 0x007, 0x242, 0x00A, 0x00D, 0x20E, 0x555, 0x40E, 0x575, 0x70E, 0x8A8, 0x999, 0xA0E, 0xBEB, 0xE5F, 0xFFF}},
+		{"ODI", "mode1+/standard_320x200/raw/ODI.SCR", cpc.ModePalOffset, 0x8D,
+			[16]uint16{0x000, 0x00F, 0x900, 0xDBF, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000}},
+		{"SXYBEAST", "mode1+/standard_320x200/raw/SXYBEAST.SCR", cpc.ModePalOffset, 0x8D,
+			[16]uint16{0x555, 0x55F, 0xFF5, 0xFFF, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000}},
+		{"PREHIST2", "mode0+/overscan_192x272/raw/PREHIST2.SCR", 0x600, 0x8C,
+			[16]uint16{0x000, 0x413, 0x455, 0x624, 0x633, 0x566, 0x676, 0x835, 0x779, 0x86A, 0x97B, 0xA5C, 0xC8D, 0xD99, 0xEBE, 0xFFF}},
+		{"SNAKLADY", "mode1+/overscan_384x272/raw/SNAKLADY.SCR", 0x600, 0x8D,
+			[16]uint16{0x024, 0x339, 0x96D, 0xFDF, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000}},
+		{"CAST", "mode2+/overscan_768x272/raw/CAST.SCR", 0x600, 0x8E,
+			[16]uint16{0x000, 0xEEA, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inPath := corpusPath(t, tc.rel)
+			raw := mustRead(t, inPath)
+			if got := raw[128+tc.offset]; got != tc.modeByte {
+				t.Fatalf("mode byte = 0x%02X, want 0x%02X", got, tc.modeByte)
+			}
+
+			outPath := filepath.Join(t.TempDir(), "out.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert failed: %v", err)
+			}
+			f, err := os.Open(outPath)
+			if err != nil {
+				t.Fatalf("open PNG failed: %v", err)
+			}
+			defer f.Close()
+			img, _, derr := image.Decode(f)
+			if derr != nil {
+				t.Fatalf("PNG failed to decode: %v", derr)
+			}
+			paletted, ok := img.(*image.Paletted)
+			if !ok {
+				t.Fatalf("PNG is %T, want an indexed image", img)
+			}
+			if len(paletted.Palette) != 16 {
+				t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+			}
+			for pen := 0; pen < 16; pen++ {
+				wantRGB := cpc.PaletteColor(int(tc.want[pen]), true)
+				got := color.RGBAModel.Convert(paletted.Palette[pen]).(color.RGBA)
+				if int(got.R) != (wantRGB>>16)&0xFF || int(got.G) != (wantRGB>>8)&0xFF || int(got.B) != wantRGB&0xFF {
+					t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (0x0VBR 0x%03X)",
+						pen, got.R, got.G, got.B, wantRGB, tc.want[pen])
+				}
+			}
+		})
 	}
 }

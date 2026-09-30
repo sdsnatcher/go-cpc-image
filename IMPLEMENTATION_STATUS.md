@@ -30,13 +30,14 @@
 
 #### Pack Command ✅
 - **Compression methods:** zx0, zx0v2, zx1, lzw, and the PKS family (pks, pksl,
-  pks3, pksp, pkvl, pkvp)
+  pks3, pksp, pkvl, pkvp, pkul, pku3, pkup)
 - **PKS palette embedding:** `--palette <file.pal>` overrides the ModePal found
-  in the input screen (PKSL only; other variants ignore it with a warning)
+  in the input screen (PKSL and PKUL; the other variants ignore it with a warning)
 - **PKS variant auto-detection:** `--method pks` picks the variant from the input
-  screen (overscan load address `&0200` or a 16K payload → `PKVL`/`PKVP`; the
-  `0x80` bit of the mode byte at `&17D0`/`&600` → `PKSP`/`PKVP`; mode 3 with a
-  valid ModePal → `PKS3`; otherwise `PKSL`), and reports the choice in the summary
+  screen (overscan load address `&0200` or a 16K payload → `PKVL`/`PKVP`; a
+  64x192 underscan payload → `PKUL`/`PKU3`/`PKUP`; the `0x80` bit of the mode
+  byte at `&17D0`/`&600` → `PKSP`/`PKVP`/`PKUP`; mode 3 with a valid ModePal →
+  `PKS3`/`PKU3`; otherwise `PKSL`), and reports the choice in the summary
 - **Compression ratio reporting**
 - **File size statistics**
 - **Rejects already-compressed input** (PKS/OCP signatures and the compressed
@@ -44,7 +45,7 @@
 
 #### Unpack Command ✅
 - **Decompression methods:** lzw, ocp, and the PKS family (pks, pksl, pks3,
-  pksp, pkvl, pkvp)
+  pksp, pkvl, pkvp, pkul, pku3, pkup)
 - **Auto-detection** from file header when `--method` is omitted (`PK` → pks;
   MJH → ocp; otherwise lzw)
 - **PKSL round-trip:** the column-major payload is scattered back into the CPC

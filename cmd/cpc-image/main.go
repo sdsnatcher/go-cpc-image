@@ -149,6 +149,7 @@ var availableFormats = []string{"scr", "asm", "dsk", "png"}
 var availableCompressionMethods = []string{
 	"zx0", "zx0v2", "zx1", "lzw",
 	"pks", "pksl", "pks3", "pksp", "pkvl", "pkvp",
+	"pkul", "pku3", "pkup",
 }
 
 func main() {
@@ -463,7 +464,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 
 	var outputSize int
 	switch compressionMethod {
-	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp":
+	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp", "pkul", "pku3", "pkup":
 		var variant compress.PKSVariant
 		autoDetected := false
 		switch compressionMethod {
@@ -477,6 +478,12 @@ func runPack(cmd *cobra.Command, args []string) error {
 			variant = compress.PKVL
 		case "pkvp":
 			variant = compress.PKVP
+		case "pkul":
+			variant = compress.PKUL
+		case "pku3":
+			variant = compress.PKU3
+		case "pkup":
+			variant = compress.PKUP
 		case "pks":
 			// --method pks auto-detects the PK* variant from the input screen.
 			autoDetected = true
@@ -521,12 +528,12 @@ func runPack(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// PKSL carries a 17-byte ModePal (mode + 16 inks). An explicit
-		// --palette file wins over the one embedded in the input screen; when
-		// neither is available the header keeps 17 zero bytes.
+		// The classic variants (PKSL, PKUL) carry a 17-byte ModePal (mode + 16
+		// inks). An explicit --palette file wins over the one embedded in the
+		// input screen; when neither is available the header keeps 17 zero bytes.
 		var palette []byte
 		switch {
-		case variant != compress.PKSL:
+		case !pksVariantEmbedsModePal(variant):
 			if paletteFile != "" {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s carries no palette; --palette ignored\n",
 					strings.ToUpper(compressionMethod))
@@ -554,8 +561,11 @@ func runPack(cmd *cobra.Command, args []string) error {
 
 		// The PKSL payload is column-major pixel data (16000 bytes); the other
 		// variants compress the screen dump as it is.
+		// The column-major variants (PKSL, PKUL) store pixel data only; both use
+		// the standard 80x200 column-major layout, the underscan image sitting
+		// inside that frame.
 		packInput := bitmap
-		if variant == compress.PKSL {
+		if _, columnMajor := pksColumnMajorPayload(variant); columnMajor {
 			packInput = cpc.ScreenToColumnMajor(bitmap, cpc.StandardCols, cpc.StandardLines)
 		}
 
@@ -709,7 +719,7 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("OCP decompression failed: %w", err)
 		}
 
-	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp":
+	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp", "pkul", "pku3", "pkup":
 		payload := inputData
 		if len(inputData) >= 128 && cpc.CheckAmsdos(inputData) {
 			payload = inputData[128:]
@@ -727,18 +737,25 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 			fmt.Printf("PKS variant: %s, CPC Plus: %v, Overscan: %v\n",
 				pksVariantName(header.Variant), header.CpcPlus, header.Overscan)
 		}
-		// A PKSL payload is column-major pixel data: scatter it back into the
-		// CPC screen layout and re-embed the ModePal so the restored .SCR is
-		// self-describing, as the original screens are.
-		if header != nil && header.Variant == compress.PKSL {
-			screen := cpc.ColumnMajorToScreen(depacked[:outputSize], cpc.StandardCols, cpc.StandardLines)
-			if anyNonZero(header.Palette[:]) {
-				screen = cpc.EmbedModePal(screen, header.Palette[:])
+		// A column-major variant (PKSL/PKUL) stores pixel data only: scatter it
+		// back into the standard CPC screen layout, keep the dump size of the
+		// variant's geometry (underscan screens end at 15872 bytes) and re-embed
+		// the ModePal, so the restored .SCR is self-describing as the original
+		// screens are. The other variants carry the screen dump as it is.
+		if header != nil {
+			if screenSize, columnMajor := pksColumnMajorPayload(header.Variant); columnMajor {
+				screen := cpc.ColumnMajorToScreen(depacked[:outputSize], cpc.StandardCols, cpc.StandardLines)
+				if screenSize < len(screen) {
+					screen = screen[:screenSize]
+				}
+				if anyNonZero(header.Palette[:]) {
+					screen = cpc.EmbedModePal(screen, header.Palette[:])
+				}
+				outputBuffer = screen
+				outputSize = len(screen)
+			} else {
+				outputBuffer = depacked
 			}
-			outputBuffer = screen
-			outputSize = len(screen)
-		} else {
-			outputBuffer = depacked
 		}
 
 	default:
@@ -809,6 +826,10 @@ func pksVariantSignals(bitmap []byte, amsAddr uint16) (overscan bool, modeByte b
 // the mode-3 case, which is only taken with the whole 17-byte block validated.
 func detectPKSVariant(bitmap []byte, amsAddr uint16) (compress.PKSVariant, int) {
 	overscan, modeByte, haveMode := pksVariantSignals(bitmap, amsAddr)
+	// Underscan screens are a different geometry (64x192 instead of 80x200),
+	// which shows in the payload size; they keep their ModePal at 0x17D0 like
+	// standard ones, so the geometry is the only extra signal needed here.
+	underscan := !overscan && len(bitmap) == cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines)
 
 	confidence := 0
 	if haveMode {
@@ -823,15 +844,53 @@ func detectPKSVariant(bitmap []byte, amsAddr uint16) (compress.PKSVariant, int) 
 	if overscan {
 		return compress.PKVL, confidence
 	}
-	if cpcPlus {
-		return compress.PKSP, confidence
+	if underscan && cpcPlus {
+		return compress.PKUP, confidence
 	}
 	// Mode 3 is only chosen when there is certainty: the byte at 0x17D0 is 3
 	// AND the whole 17-byte block validates as a ModePal.
 	if mode == 3 && cpc.ExtractModePal(bitmap) != nil {
+		if underscan {
+			return compress.PKU3, 2
+		}
 		return compress.PKS3, 2
 	}
+	if underscan {
+		return compress.PKUL, confidence
+	}
+	if cpcPlus {
+		return compress.PKSP, confidence
+	}
 	return compress.PKSL, confidence
+}
+
+// pksVariantEmbedsModePal reports whether `pack` fills the variant's 17-byte
+// palette field from the screen's ModePal (or from --palette). PKUP has that
+// field — its compressed data starts at offset 21 like PKSL's — but a CPC Plus
+// palette does not fit in 17 bytes: it lives in the packed screen dump itself,
+// so the field stays empty.
+func pksVariantEmbedsModePal(variant compress.PKSVariant) bool {
+	switch variant {
+	case compress.PKSL, compress.PKUL:
+		return true
+	}
+	return false
+}
+
+// pksColumnMajorPayload reports whether a variant stores its payload as
+// column-major pixel data and, when it does, the size of the screen dump it
+// restores. The payload itself always uses the standard 80x200 layout: the
+// reference underscan files (PKUL) pack that way, with the underscan image
+// inside the standard pixel frame. The restored screen keeps the variant's own
+// geometry, i.e. 15872 bytes for underscan instead of 16336.
+func pksColumnMajorPayload(variant compress.PKSVariant) (screenSize int, columnMajor bool) {
+	switch variant {
+	case compress.PKSL:
+		return cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines), true
+	case compress.PKUL:
+		return cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines), true
+	}
+	return 0, false
 }
 
 // pksVariantName returns a human-readable name for a PKS variant.
@@ -847,6 +906,12 @@ func pksVariantName(variant compress.PKSVariant) string {
 		return "PKVL (overscan standard)"
 	case compress.PKVP:
 		return "PKVP (overscan Plus)"
+	case compress.PKUL:
+		return "PKUL (underscan standard)"
+	case compress.PKU3:
+		return "PKU3 (underscan mode 3)"
+	case compress.PKUP:
+		return "PKUP (underscan Plus)"
 	default:
 		return "unknown"
 	}
@@ -856,9 +921,11 @@ func pksVariantName(variant compress.PKSVariant) string {
 // payload size (standard or overscan bitmap).
 func isKnownScreenSize(n int) bool {
 	screenSizes := map[int]bool{
-		cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines): true,
-		cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines): true,
-		cpc.StandardCols * cpc.StandardLines:                true, // PKSL pixel payload
+		cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines):   true,
+		cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines):   true,
+		cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines): true,
+		cpc.StandardCols * cpc.StandardLines:                  true, // PKSL pixel payload
+		cpc.UnderscanCols * cpc.UnderscanLines:                true, // PKUL pixel payload
 	}
 	return screenSizes[n]
 }
@@ -877,7 +944,12 @@ func looksLikeRawSCR(data []byte) bool {
 		payload = data[128:]
 	}
 	// Size heuristic with a small tolerance for slightly different writers.
-	for _, target := range []int{16336, 31936} {
+	bitmapSizes := []int{
+		cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines),
+		cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines),
+		cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines),
+	}
+	for _, target := range bitmapSizes {
 		d := len(payload) - target
 		if d < 0 {
 			d = -d
