@@ -3,12 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -208,30 +208,213 @@ func TestCLIUnpackRejectsRawSCR(t *testing.T) {
 	// The strong raw-input rejection lives in the auto-detect path above.
 }
 
-// TestCLIUnpackRejectsPKSAutoDetect verifies that in auto-detect mode the CLI
-// refuses to unpack a PKS file (signature "PK…"), because the column-major →
-// CPC-screen conversion is not yet implemented. This prevents silently
-// emitting a corrupt .SCR.
-//
-// It uses a real sample file shipped in the go-cpc-image-1.2.0-pks reference
-// tree (git-ignored from the repo). The path is resolved relative to this
-// source file so it works regardless of the working directory that `go test`
-// picks for the package.
-func TestCLIUnpackRejectsPKSAutoDetect(t *testing.T) {
-	// Resolve repo root via the test file's own location: this file lives at
-	// cmd/cpc-image/main_test.go, so the repo root is two directories up.
-	_, thisFile, _, _ := runtime.Caller(0)
-	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
-	pksFile := filepath.Join(repoRoot, "go-cpc-image-1.2.0-pks", "samples",
-		"mode0", "standard_160x200", "pk_compressed", "ABUSIMB.SCR")
-	if _, err := os.Stat(pksFile); err != nil {
-		t.Skipf("skipping test: sample PKS file not found (%v)", err)
+// TestCLIPackAndUnpackPKS verifies the PKS family round-trip through the CLI.
+// Every variant must pack into AMSDOS + "PKxx" (auto-detected again on unpack)
+// and restore the original screen: for PKSL the pixel data is compared in
+// column-major order, because the restored dump has its layout gaps zeroed and
+// only the ModePal re-embedded; the other variants carry the screen dump as-is
+// and must match byte-for-byte.
+func TestCLIPackAndUnpackPKS(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Synthetic standard screen dump with a valid ModePal at 0x17D0.
+	testData := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	modePal := []byte{1, 0, 1, 2, 3, 6, 9, 10, 11, 12, 15, 18, 19, 20, 24, 25, 26}
+	testData = cpc.EmbedModePal(testData, modePal)
+
+	inputPath := filepath.Join(tempDir, "screen.bin")
+	if err := os.WriteFile(inputPath, testData, 0644); err != nil {
+		t.Fatalf("write input failed: %v", err)
 	}
 
+	methods := []struct {
+		name    string
+		method  string
+		variant compress.PKSVariant
+		isPKSL  bool
+	}{
+		{"PKS_Default", "pks", compress.PKSL, true},
+		{"PKSL_Standard", "pksl", compress.PKSL, true},
+		{"PKS3_Mode3", "pks3", compress.PKS3, false},
+		{"PKSP_Plus", "pksp", compress.PKSP, false},
+		{"PKVL_Overscan", "pkvl", compress.PKVL, false},
+		{"PKVP_OverscanPlus", "pkvp", compress.PKVP, false},
+	}
+
+	for _, tc := range methods {
+		t.Run(tc.name, func(t *testing.T) {
+			packedPath := filepath.Join(tempDir, tc.name+".pks")
+			unpackedPath := filepath.Join(tempDir, tc.name+"_restored.bin")
+
+			rootCmd.SetArgs([]string{"pack", "-i", inputPath, "-o", packedPath, "--method", tc.method})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack failed for method %s: %v", tc.method, err)
+			}
+
+			packedData := mustRead(t, packedPath)
+			if !cpc.CheckAmsdos(packedData) {
+				t.Fatal("packed file is missing a valid AMSDOS header")
+			}
+			if len(packedData) < 132 {
+				t.Fatalf("packed file too short: %d bytes", len(packedData))
+			}
+			header, err := compress.ParsePKSHeader(packedData[128:])
+			if err != nil {
+				t.Fatalf("ParsePKSHeader failed: %v", err)
+			}
+			if header.Variant != tc.variant {
+				t.Errorf("header variant = %v, want %v", header.Variant, tc.variant)
+			}
+			if tc.isPKSL {
+				if header.DataOffset != 21 {
+					t.Errorf("PKSL payload offset = %d, want 21", header.DataOffset)
+				}
+				if header.Palette[0] != modePal[0] {
+					t.Errorf("PKSL mode = %d, want %d", header.Palette[0], modePal[0])
+				}
+				if !bytes.Equal(header.Palette[1:17], modePal[1:17]) {
+					t.Errorf("PKSL inks mismatch: got %v want %v", header.Palette[1:17], modePal[1:17])
+				}
+			}
+
+			// Auto-detect mode: no --method, the "PK" signature must suffice.
+			rootCmd.SetArgs([]string{"unpack", "-i", packedPath, "-o", unpackedPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("unpack failed for %s: %v", packedPath, err)
+			}
+
+			restored := mustRead(t, unpackedPath)
+			if tc.isPKSL {
+				if !bytes.Equal(cpc.ScreenToColumnMajor(restored), cpc.ScreenToColumnMajor(testData)) {
+					t.Error("PKSL pixel data mismatch after round-trip")
+				}
+			} else if !bytes.Equal(restored, testData) {
+				t.Errorf("restored data differs from the original (got %d bytes, want %d)",
+					len(restored), len(testData))
+			}
+		})
+	}
+}
+
+// TestCLIPackPaletteFlag verifies the `pack --palette <file.pal>` support: the
+// external palette overrides the ModePal embedded in the input screen, is stored
+// in the PKSL header, survives the unpack round-trip, and is ignored (with a
+// warning) by the variants that carry no palette.
+func TestCLIPackPaletteFlag(t *testing.T) {
 	tempDir := t.TempDir()
-	rootCmd.SetArgs([]string{"unpack", "-i", pksFile, "-o", filepath.Join(tempDir, "test.scr")})
-	if err := rootCmd.Execute(); err == nil {
-		t.Error("unpack should reject PKS files in auto-detect mode (decompression not implemented)")
+
+	// Input screen carrying its own ModePal (mode 1 + inks).
+	embedded := []byte{1, 0, 1, 2, 3, 6, 9, 10, 11, 12, 15, 18, 19, 20, 24, 25, 26}
+	testData := cpc.EmbedModePal(mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)), embedded)
+	inputPath := filepath.Join(tempDir, "screen.bin")
+	if err := os.WriteFile(inputPath, testData, 0644); err != nil {
+		t.Fatalf("write input failed: %v", err)
+	}
+
+	// External palette file, shaped like a real .pal (payload = mode + 16 inks).
+	extPal := []uint16{0, 24, 20, 6, 26, 0, 2, 7, 10, 12, 14, 16, 18, 22, 1, 14}
+	palPath := filepath.Join(tempDir, "external.pal")
+	if err := fileio.SavePalette(palPath, extPal, fileio.SCRParams{VirtualMode: 1}); err != nil {
+		t.Fatalf("SavePalette failed: %v", err)
+	}
+	want := make([]byte, 17)
+	want[0] = 1 // mode read back from the .pal payload
+	for i, ink := range extPal {
+		want[1+i] = byte(ink)
+	}
+
+	packHeader := func(t *testing.T, name string, args ...string) *compress.PKSHeader {
+		t.Helper()
+		out := filepath.Join(tempDir, name+".pks")
+		cmdArgs := append([]string{"pack", "-i", inputPath, "-o", out, "--method", "pksl"}, args...)
+		rootCmd.SetArgs(cmdArgs)
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("pack %s failed: %v", name, err)
+		}
+		packed := mustRead(t, out)
+		if !cpc.CheckAmsdos(packed) {
+			t.Fatalf("packed file %s has no AMSDOS header", name)
+		}
+		header, err := compress.ParsePKSHeader(packed[128:])
+		if err != nil {
+			t.Fatalf("ParsePKSHeader failed: %v", err)
+		}
+		return header
+	}
+
+	// Warnings are written to the command's stderr, and `--palette` binds a
+	// process-global variable, so clear it before runs that must not see the
+	// value left behind by an earlier Execute() in this test.
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+	resetPalette := func(t *testing.T) {
+		t.Helper()
+		if err := packCmd.Flags().Set("palette", ""); err != nil {
+			t.Fatalf("reset --palette failed: %v", err)
+		}
+	}
+	resetPalette(t)
+
+	// Without --palette the ModePal embedded in the screen is used.
+	if got := packHeader(t, "embedded").Palette; !bytes.Equal(got[:], embedded) {
+		t.Errorf("embedded ModePal = % x, want % x", got, embedded)
+	}
+
+	// With --palette the external file wins.
+	if got := packHeader(t, "external", "--palette", palPath).Palette; !bytes.Equal(got[:], want) {
+		t.Errorf("--palette ModePal = % x, want % x", got, want)
+	}
+
+	// ...and it is re-embedded when the packed screen is unpacked again.
+	restoredPath := filepath.Join(tempDir, "external_restored.scr")
+	rootCmd.SetArgs([]string{"unpack", "-i", filepath.Join(tempDir, "external.pks"), "-o", restoredPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack failed: %v", err)
+	}
+	restored := mustRead(t, restoredPath)
+	if !bytes.Equal(restored[0x17D0:0x17D0+17], want) {
+		t.Errorf("restored ModePal = % x, want % x", restored[0x17D0:0x17D0+17], want)
+	}
+
+	// Variants without a palette accept the flag but ignore it (with a warning).
+	stderr.Reset()
+	pkvlPath := filepath.Join(tempDir, "ignored.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", inputPath, "-o", pkvlPath, "--method", "pkvl", "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack pkvl with --palette should still succeed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "carries no palette") {
+		t.Errorf("expected a '--palette ignored' warning, got: %q", stderr.String())
+	}
+	if h, err := compress.ParsePKSHeader(mustRead(t, pkvlPath)[128:]); err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	} else if h.DataOffset != 4 {
+		t.Errorf("PKVL payload offset = %d, want 4 (no palette)", h.DataOffset)
+	}
+
+	// A screen whose ModePal block is empty has no usable palette: warn and
+	// leave the header palette empty instead of silently claiming black pens.
+	noPalPath := filepath.Join(tempDir, "nopal.bin")
+	if err := os.WriteFile(noPalPath, mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)), 0644); err != nil {
+		t.Fatalf("write palette-less input failed: %v", err)
+	}
+	stderr.Reset()
+	resetPalette(t)
+	noPalPKS := filepath.Join(tempDir, "nopal.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", noPalPath, "-o", noPalPKS, "--method", "pksl"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack without a usable palette should still succeed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "no usable ModePal") {
+		t.Errorf("expected a 'no usable ModePal' warning, got: %q", stderr.String())
+	}
+	h, err := compress.ParsePKSHeader(mustRead(t, noPalPKS)[128:])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	if anyNonZero(h.Palette[:]) {
+		t.Errorf("header palette = % x, want an empty palette", h.Palette)
 	}
 }
 
