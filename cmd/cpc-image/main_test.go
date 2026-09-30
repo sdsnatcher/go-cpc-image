@@ -892,3 +892,67 @@ func TestCLIPackAutoDetectPKSVariant(t *testing.T) {
 		}
 	})
 }
+
+// corpusPath returns the path of a read-only sample in the reference sample
+// tree, skipping the test when that tree is not checked out (it is not part of
+// this repository).
+func corpusPath(t *testing.T, rel string) string {
+	t.Helper()
+	p := filepath.Join("..", "..", "go-cpc-image-1.2.0-pks", "samples", filepath.FromSlash(rel))
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("sample not available: %s", p)
+	}
+	return p
+}
+
+// TestCLIConvertUnderscanSCRToPNG verifies that a raw underscan screen is
+// rendered with the underscan geometry and with the palette embedded at
+// 0x17D0, instead of the standard 80x200 layout.
+func TestCLIConvertUnderscanSCRToPNG(t *testing.T) {
+	inPath := corpusPath(t, "mode1/underscan_256x192/raw/BATMAN1.SCR")
+	outPath := filepath.Join(t.TempDir(), "underscan.png")
+
+	rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert SCR -> PNG failed: %v", err)
+	}
+
+	f, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open PNG failed: %v", err)
+	}
+	defer f.Close()
+	img, _, derr := image.Decode(f)
+	if derr != nil {
+		t.Fatalf("PNG failed to decode: %v", derr)
+	}
+	if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
+		t.Errorf("underscan PNG is %dx%d, want 512x384 (64x192 code space)", got.Dx(), got.Dy())
+	}
+
+	// The palette must be the ModePal read at 0x17D0, in pen order.
+	raw := mustRead(t, inPath)
+	if !cpc.CheckAmsdos(raw) {
+		t.Fatal("underscan sample has no AMSDOS header")
+	}
+	modePal := raw[128+cpc.ModePalOffset : 128+cpc.ModePalOffset+17]
+	paletted, ok := img.(*image.Paletted)
+	if !ok {
+		t.Fatalf("underscan PNG is %T, want an indexed image", img)
+	}
+	if len(paletted.Palette) != 16 {
+		t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+	}
+	for pen := 0; pen < 16; pen++ {
+		ink := int(modePal[1+pen])
+		if ink == 0xFF {
+			ink = 0
+		}
+		want := cpc.PaletteColor(ink, false)
+		got := color.RGBAModel.Convert(paletted.Palette[pen]).(color.RGBA)
+		if int(got.R) != (want>>16)&0xFF || int(got.G) != (want>>8)&0xFF || int(got.B) != want&0xFF {
+			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (ink %d)",
+				pen, got.R, got.G, got.B, want, ink)
+		}
+	}
+}

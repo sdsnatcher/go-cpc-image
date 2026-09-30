@@ -1116,6 +1116,18 @@ func nearestPalIndex(palRGB []int, rgb int) uint8 {
 	return uint8(best)
 }
 
+// scrGeometry returns the CPC screen geometry (bytes per line, lines) of a raw
+// SCR payload. Underscan dumps — BitmapSize(64, 192) bytes — use the underscan
+// layout instead of the standard 80x200 one, whose pixel addresses differ.
+// Overscan dumps are not special-cased yet: faithful overscan rendering is a
+// separate change, which can extend this helper with the AMSDOS load address.
+func scrGeometry(payloadLen int) (numCol, numLig int) {
+	if payloadLen == cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines) {
+		return cpc.UnderscanCols, cpc.UnderscanLines
+	}
+	return cpc.StandardCols, cpc.StandardLines
+}
+
 // convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
 // This is the reverse direction of the normal convert command: input is .SCR,
 // output is .PNG. warn receives a warning when the screen carries no usable
@@ -1138,6 +1150,10 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
 		return fmt.Errorf("input file is PKS-compressed, which convert does not support: %s", inputFile)
 	}
 
+	// Underscan dumps are 15872 bytes and their pixel addresses differ from the
+	// standard 80x200 layout, so read the geometry before the padding below.
+	numCol, numLig := scrGeometry(len(payload))
+
 	// LoadSCR needs at least 16384 bytes; a standard SCR payload is 16336.
 	if len(payload) < 16384 {
 		pad := make([]byte, 16384)
@@ -1150,7 +1166,7 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
 		return fmt.Errorf("failed to load SCR data: %w", lerr)
 	}
 
-	bmp := render.NewBitmapCpcWithParams(cpc.StandardCols, cpc.StandardLines, false)
+	bmp := render.NewBitmapCpcWithParams(numCol, numLig, false)
 	copy(bmp.ScreenData[:], screenData)
 
 	// ModePal offset: standard SCR layout places the mode + palette at
