@@ -127,6 +127,16 @@ so the flag is ignored with a warning. When the screen has no usable (non-empty)
 ModePal and no `--palette` is given, the header keeps an empty palette and a
 warning is printed.
 
+**Compressing the screen, not the header:** every method — the whole PKS family
+included — strips a leading AMSDOS header first, so the packed stream holds
+exactly the payload a CPC decompressor writes back to memory (128 bytes less, and
+no shift in the picture). The header is recognised by its checksum or — when that
+checksum is not one this tool validates — by its fields: binary file type, a
+length that matches the file, a screen load address (`&C000` or `&0200`) and a
+payload of a screen size. A file that is not screen-shaped is compressed as it
+is, header included. The reported ratio is measured against the compressed
+payload, and `-v` says when a header was stripped.
+
 **Rejecting already-compressed input:** `pack` refuses to re-compress data that
 is already compressed and exits with a **non-zero code** so scripts can react.
 A PKS `PK` signature, an OCP `MJH` signature, or the compressed file

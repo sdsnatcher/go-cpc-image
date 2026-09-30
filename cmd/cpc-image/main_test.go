@@ -146,6 +146,141 @@ func TestCLIPackAcceptsLegitSCR(t *testing.T) {
 	}
 }
 
+// TestCLIPackStripsAmsdosHeaderForEveryMethod verifies that every pack method
+// compresses the screen payload only: for a screen file with an AMSDOS header
+// the output must be byte-for-byte the stream of the bare payload, so that a
+// decompressor writing back at the load address gets the picture and not 128
+// header bytes followed by a shifted image. lzw is also unpacked again to check
+// the CLI round-trip.
+func TestCLIPackStripsAmsdosHeaderForEveryMethod(t *testing.T) {
+	tempDir := t.TempDir()
+	payload := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	inPath := filepath.Join(tempDir, "headed.scr")
+	header, herr := cpc.AmsdosToByte(cpc.CreeEntete("screen.scr", 0xC000, uint16(len(payload)), 0xC7D0))
+	if herr != nil {
+		t.Fatalf("AmsdosToByte failed: %v", herr)
+	}
+	if werr := os.WriteFile(inPath, append(append([]byte{}, header...), payload...), 0644); werr != nil {
+		t.Fatalf("write fixture failed: %v", werr)
+	}
+
+	for _, tc := range []struct {
+		method string
+		pm     compress.PackMethod
+	}{
+		{"zx0", compress.MethodZX0},
+		{"zx0v2", compress.MethodZX0V2},
+		{"zx1", compress.MethodZX1},
+		{"lzw", compress.Standard},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			outPath := filepath.Join(tempDir, "headed_"+tc.method+".bin")
+			rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", outPath, "--method", tc.method})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack failed: %v", err)
+			}
+
+			// Reference: the same compressor fed with the bare payload.
+			want := make([]byte, len(payload)*2+1024)
+			wn, werr := compress.NewCompressor().Pack(payload, len(payload), want, 0, tc.pm)
+			if werr != nil {
+				t.Fatalf("reference Pack failed: %v", werr)
+			}
+			got := mustRead(t, outPath)
+			if !bytes.Equal(got, want[:wn]) {
+				t.Errorf("pack output is %d bytes, want the %d-byte stream of the bare payload (the AMSDOS header must not be compressed)",
+					len(got), wn)
+			}
+		})
+	}
+
+	// lzw is the method unpack understands, so its round-trip can be checked end
+	// to end: the restored stream must be the payload, never header + payload.
+	packedPath := filepath.Join(tempDir, "headed_lzw.bin")
+	rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", packedPath, "--method", "lzw"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack (lzw) failed: %v", err)
+	}
+	restoredPath := filepath.Join(tempDir, "headed_restored.bin")
+	rootCmd.SetArgs([]string{"unpack", "-i", packedPath, "-o", restoredPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack failed: %v", err)
+	}
+	if restored := mustRead(t, restoredPath); !bytes.Equal(restored, payload) {
+		t.Errorf("unpacked stream is %d bytes, want the %d-byte payload without the header",
+			len(restored), len(payload))
+	}
+}
+
+// TestCLIPackAmsdosLeniency pins the two edges of the header detection: a screen
+// whose AMSDOS checksum does not validate is still recognised from its fields
+// (compressing that header would shift the whole picture), while a file that is
+// neither checksum-valid nor screen shaped is compressed as it is, header
+// included.
+func TestCLIPackAmsdosLeniency(t *testing.T) {
+	tempDir := t.TempDir()
+	payload := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+
+	headerBytes, herr := cpc.AmsdosToByte(cpc.CreeEntete("screen.scr", 0xC000, uint16(len(payload)), 0xC7D0))
+	if herr != nil {
+		t.Fatalf("AmsdosToByte failed: %v", herr)
+	}
+	badHeader := append([]byte{}, headerBytes...)
+	badHeader[0x43] ^= 0xFF // corrupt the stored checksum only
+	if cpc.CheckAmsdos(badHeader) {
+		t.Fatal("fixture corruption did not invalidate the checksum")
+	}
+
+	// (1) Corrupted checksum, screen-shaped fields: still stripped.
+	badScreen := filepath.Join(tempDir, "badsum.scr")
+	if werr := os.WriteFile(badScreen, append(append([]byte{}, badHeader...), payload...), 0644); werr != nil {
+		t.Fatalf("write fixture failed: %v", werr)
+	}
+	wantStripped := make([]byte, len(payload)*2+1024)
+	wn, werr := compress.NewCompressor().Pack(payload, len(payload), wantStripped, 0, compress.MethodZX0)
+	if werr != nil {
+		t.Fatalf("reference Pack failed: %v", werr)
+	}
+	badOut := filepath.Join(tempDir, "badsum.bin")
+	rootCmd.SetArgs([]string{"pack", "-i", badScreen, "-o", badOut, "--method", "zx0"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack failed: %v", err)
+	}
+	if got := mustRead(t, badOut); !bytes.Equal(got, wantStripped[:wn]) {
+		t.Error("a screen with a non-standard checksum was not recognised as a screen")
+	}
+
+	// (2) Corrupted checksum and no screen shape (a 4096-byte payload): the
+	// header stays part of the compressed data.
+	binPayload := make([]byte, 4096)
+	binHeader, berr := cpc.AmsdosToByte(cpc.CreeEntete("program.bin", 0xC000, uint16(len(binPayload)), 0xC000))
+	if berr != nil {
+		t.Fatalf("AmsdosToByte failed: %v", berr)
+	}
+	binHeader[0x43] ^= 0xFF
+	if cpc.CheckAmsdos(binHeader) {
+		t.Fatal("fixture corruption did not invalidate the checksum")
+	}
+	binary := append(append([]byte{}, binHeader...), binPayload...)
+	binPath := filepath.Join(tempDir, "program.bin")
+	if werr := os.WriteFile(binPath, binary, 0644); werr != nil {
+		t.Fatalf("write fixture failed: %v", werr)
+	}
+	wantWhole := make([]byte, len(binary)*2+1024)
+	wwn, wwerr := compress.NewCompressor().Pack(binary, len(binary), wantWhole, 0, compress.MethodZX0)
+	if wwerr != nil {
+		t.Fatalf("reference Pack (binary) failed: %v", wwerr)
+	}
+	binOut := filepath.Join(tempDir, "program.zx0")
+	rootCmd.SetArgs([]string{"pack", "-i", binPath, "-o", binOut, "--method", "zx0"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack (binary) failed: %v", err)
+	}
+	if got := mustRead(t, binOut); !bytes.Equal(got, wantWhole[:wwn]) {
+		t.Error("a file that is not a screen must keep its AMSDOS header inside the compressed data")
+	}
+}
+
 // writeTestPNG creates a small 160x200 PNG with a white rectangle on a black
 // background — a copyright-safe fixture generated at runtime.
 func writeTestPNG(t *testing.T, dir string, name string) string {

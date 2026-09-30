@@ -391,6 +391,43 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// screenAmsdosPayload reports whether data starts with an AMSDOS header that
+// describes a whole screen and, when it does, returns the payload that follows
+// it together with the declared load address. Headers whose checksum this
+// package does not validate are accepted as well, as long as their fields
+// describe a screen: some writers produce a checksum CheckAmsdos rejects, and
+// refusing those would compress the header as if it were picture data. A file
+// that is not a screen is left alone, so pack never drops a header it should
+// keep.
+func screenAmsdosPayload(data []byte) ([]byte, uint16, bool) {
+	if len(data) < 128 {
+		return nil, 0, false
+	}
+
+	ent, err := cpc.GetAmsdos(data)
+	if err != nil {
+		return nil, 0, false
+	}
+	if cpc.CheckAmsdos(data) {
+		return data[128:], ent.Address, true
+	}
+
+	// Lenient path: binary file type, a length that matches the file, a screen
+	// load address and a payload of a size a CPC screen can have. This is the
+	// shape of the reference screens and of the packed files built around them.
+	payload := len(data) - 128
+	if ent.FileType != 2 || int(ent.Length) != payload {
+		return nil, 0, false
+	}
+	if ent.Address != 0xC000 && ent.Address != 0x0200 {
+		return nil, 0, false
+	}
+	if !isKnownScreenSize(payload) {
+		return nil, 0, false
+	}
+	return data[128:], ent.Address, true
+}
+
 // runPack handles the pack command
 func runPack(cmd *cobra.Command, args []string) error {
 	// Validate input file exists
@@ -462,6 +499,19 @@ func runPack(cmd *cobra.Command, args []string) error {
 	compressor := compress.NewCompressor()
 	outputBuffer := make([]byte, inputSize*2) // Allocate extra space
 
+	// Only the screen payload is compressed, whatever the method: an AMSDOS
+	// header is stripped first, so the packed stream holds exactly what a CPC
+	// decompressor has to write back to memory. The load address separates an
+	// overscan dump (#0200) from a standard one and feeds the PKS detection.
+	bitmap, amsAddr, stripped := inputData, uint16(0), false
+	if p, addr, ok := screenAmsdosPayload(inputData); ok {
+		bitmap, amsAddr, stripped = p, addr, true
+		if verbose {
+			fmt.Println("AMSDOS header detected; packing bitmap payload only")
+		}
+	}
+	packedInputSize := len(bitmap)
+
 	var outputSize int
 	switch compressionMethod {
 	case "pks", "pksl", "pks3", "pksp", "pkvl", "pkvp", "pkul", "pku3", "pkup":
@@ -487,20 +537,6 @@ func runPack(cmd *cobra.Command, args []string) error {
 		case "pks":
 			// --method pks auto-detects the PK* variant from the input screen.
 			autoDetected = true
-		}
-
-		// Strip a valid AMSDOS header: only the bitmap is compressed. The load
-		// address separates an overscan dump (#0200) from a standard one.
-		bitmap := inputData
-		amsAddr := uint16(0)
-		if len(inputData) >= 128 && cpc.CheckAmsdos(inputData) {
-			bitmap = inputData[128:]
-			if ent, e := cpc.GetAmsdos(inputData); e == nil {
-				amsAddr = ent.Address
-			}
-			if verbose {
-				fmt.Println("AMSDOS header detected; packing bitmap payload only")
-			}
 		}
 
 		// Auto-detect the PK* variant when the user asked for --method pks.
@@ -568,6 +604,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 		if _, columnMajor := pksColumnMajorPayload(variant); columnMajor {
 			packInput = cpc.ScreenToColumnMajor(bitmap, cpc.StandardCols, cpc.StandardLines)
 		}
+		packedInputSize = len(packInput)
 
 		pksBuf := make([]byte, len(packInput)*2+1024)
 		packedSize, packErr := compressor.PKS().PackPKS(packInput, len(packInput), pksBuf, variant, palette)
@@ -606,7 +643,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 			packMethod = compress.Standard
 		}
 
-		outputSize, err = compressor.Pack(inputData, inputSize, outputBuffer, 0, packMethod)
+		outputSize, err = compressor.Pack(bitmap, len(bitmap), outputBuffer, 0, packMethod)
 		if err != nil {
 			return fmt.Errorf("compression failed: %w", err)
 		}
@@ -621,11 +658,15 @@ func runPack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write output file: %w", err)
 	}
 
-	// Print summary
-	compressionRatio := float64(outputSize) / float64(inputSize) * 100
+	// Print summary. The ratio is measured against the compressed payload, never
+	// against the file size: an AMSDOS header is not compressed.
+	compressionRatio := float64(outputSize) / float64(packedInputSize) * 100
 
 	fmt.Printf("Compression successful!\n")
 	fmt.Printf("  Input: %s (%d bytes)\n", inputFile, inputSize)
+	if stripped {
+		fmt.Printf("  Compressed payload: %d bytes (AMSDOS header stripped)\n", packedInputSize)
+	}
 	fmt.Printf("  Output: %s (%d bytes)\n", outputFile, outputSize)
 	fmt.Printf("  Method: %s\n", compressionMethod)
 	if pksAutoDetected {
@@ -633,7 +674,7 @@ func runPack(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  Compression ratio: %.1f%%\n", compressionRatio)
 	fmt.Printf("  Space saved: %d bytes (%.1f%%)\n",
-		inputSize-outputSize, 100.0-compressionRatio)
+		packedInputSize-outputSize, 100.0-compressionRatio)
 
 	return nil
 }

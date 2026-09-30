@@ -40,6 +40,11 @@
   64x192 underscan payload → `PKUL`/`PKU3`/`PKUP`; the `0x80` bit of the mode
   byte at `&17D0`/`&600` → `PKSP`/`PKVP`/`PKUP`; mode 3 with a valid ModePal →
   `PKS3`/`PKU3`; otherwise `PKSL`), and reports the choice in the summary
+- **AMSDOS header stripping:** every method (the PKS family included) compresses
+  the screen payload only, never the 128-byte header; a header whose checksum is
+  not the one this tool validates is still recognised from its fields (binary
+  type, matching length, screen load address, screen-sized payload), while a file
+  that is not screen-shaped keeps its header
 - **Compression ratio reporting**
 - **File size statistics**
 - **Rejects already-compressed input** (PKS/OCP signatures and the compressed
