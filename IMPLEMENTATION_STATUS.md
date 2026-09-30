@@ -32,7 +32,9 @@
 - **Compression methods:** zx0, zx0v2, zx1, lzw, and the PKS family (pks, pksl,
   pks3, pksp, pkvl, pkvp, pkul, pku3, pkup)
 - **PKS palette embedding:** `--palette <file.pal>` overrides the ModePal found
-  in the input screen (PKSL and PKUL; the other variants ignore it with a warning)
+  in the input screen (PKSL and PKUL, the only variants with a 17-byte palette
+  field; the others carry no field — a CPC Plus palette travels inside the packed
+  screen — so the flag is ignored with a warning)
 - **PKS variant auto-detection:** `--method pks` picks the variant from the input
   screen (overscan load address `&0200` or a 16K payload → `PKVL`/`PKVP`; a
   64x192 underscan payload → `PKUL`/`PKU3`/`PKUP`; the `0x80` bit of the mode

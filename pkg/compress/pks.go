@@ -34,11 +34,13 @@ const (
 
 // HasPalette reports whether the variant stores the 17-byte ModePal field
 // (mode byte + 16 ink values) between its 4-byte signature and the compressed
-// data: that is the "L"-flavoured layout. The other variants start their
-// payload right after the signature.
+// data. Only the "L"-flavoured variants do: their payload is column-major pixel
+// data, so the palette has nowhere else to live. Every other variant packs the
+// screen dump as it is, palette block included - a CPC Plus palette is 33 bytes
+// and travels inside that dump, at &17D0 as in the raw saves.
 func (v PKSVariant) HasPalette() bool {
 	switch v {
-	case PKSL, PKUL, PKUP:
+	case PKSL, PKUL:
 		return true
 	}
 	return false
@@ -49,7 +51,9 @@ type PKSHeader struct {
 	Variant  PKSVariant
 	CpcPlus  bool
 	Overscan bool
-	// Palette holds up to 17 bytes of palette data (for PKSL: ink values at offset 4..20)
+	// Palette holds the 17 bytes read from the header field at offset 4; only the
+	// "L" variants have that field, so it stays empty for every other variant (a
+	// CPC Plus palette lives inside the packed dump instead).
 	Palette [17]byte
 	// DataOffset is where the compressed data starts in the input buffer
 	DataOffset int
@@ -115,8 +119,8 @@ func ParsePKSHeader(bufIn []byte) (*PKSHeader, error) {
 		return nil, ErrUnknownVariant
 	}
 
-	// The classic-palette variants carry 17 bytes of palette at offset 4 and
-	// their data starts at offset 21.
+	// The "L" variants carry 17 bytes of palette at offset 4 and their data
+	// starts at offset 21; every other variant starts right after the signature.
 	if h.Variant.HasPalette() {
 		if len(bufIn) < 21 {
 			return nil, ErrInputTooShort
@@ -194,7 +198,7 @@ func (p *PKS) PackPKS(bufIn []byte, lengthIn int, bufOut []byte, variant PKSVari
 	}
 	pos = 4
 
-	// The classic-palette variants include 17 bytes of palette
+	// The "L" variants include 17 bytes of palette
 	if variant.HasPalette() {
 		if pos+17 > len(bufOut) {
 			return 0, ErrOutputTooSmall

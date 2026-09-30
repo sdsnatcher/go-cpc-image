@@ -1006,8 +1006,11 @@ func TestCLIPackUnderscanPlusRoundTrip(t *testing.T) {
 	if !header.CpcPlus {
 		t.Error("PKUP should report CpcPlus")
 	}
-	if header.DataOffset != 21 {
-		t.Errorf("PKUP data offset = %d, want 21 (palette field present)", header.DataOffset)
+	if header.DataOffset != 4 {
+		t.Errorf("PKUP data offset = %d, want 4 (no palette field)", header.DataOffset)
+	}
+	if header.Palette != ([17]byte{}) {
+		t.Errorf("PKUP palette field = % x, want empty", header.Palette[:])
 	}
 
 	unpackedPath := filepath.Join(tempDir, "plus_restored.bin")
@@ -1015,8 +1018,14 @@ func TestCLIPackUnderscanPlusRoundTrip(t *testing.T) {
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("unpack failed: %v", err)
 	}
-	if restored := mustRead(t, unpackedPath); !bytes.Equal(restored, scrData[128:]) {
+	restored := mustRead(t, unpackedPath)
+	if !bytes.Equal(restored, scrData[128:]) {
 		t.Error("PKUP round-trip is not byte-for-byte")
+	}
+	// PKUP has no palette field, so the 33-byte Plus block must travel inside
+	// the packed payload itself.
+	if restored[0x17D0]&0x80 == 0 {
+		t.Errorf("restored PKUP dump lost the Plus block at 0x17D0: 0x%02X", restored[0x17D0])
 	}
 
 	// The restored screen must render with the Plus palette at 0x17D0.

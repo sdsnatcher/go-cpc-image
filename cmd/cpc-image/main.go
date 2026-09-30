@@ -865,10 +865,11 @@ func detectPKSVariant(bitmap []byte, amsAddr uint16) (compress.PKSVariant, int) 
 }
 
 // pksVariantEmbedsModePal reports whether `pack` fills the variant's 17-byte
-// palette field from the screen's ModePal (or from --palette). PKUP has that
-// field — its compressed data starts at offset 21 like PKSL's — but a CPC Plus
-// palette does not fit in 17 bytes: it lives in the packed screen dump itself,
-// so the field stays empty.
+// palette field from the screen's ModePal (or from --palette). Only the "L"
+// variants have that field: their payload is column-major pixel data, so the
+// palette has nowhere else to live. A CPC Plus palette neither fits in 17 bytes
+// nor needs the field — it lives inside the packed screen dump itself, at
+// &17D0, and the Plus variants carry it through the payload.
 func pksVariantEmbedsModePal(variant compress.PKSVariant) bool {
 	switch variant {
 	case compress.PKSL, compress.PKUL:

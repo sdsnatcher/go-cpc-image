@@ -29,7 +29,7 @@ func TestParsePKSHeaderAllVariants(t *testing.T) {
 		{"PKVP overscan Plus", "PKVP", false, PKVP, true, true},
 		{"PKUL underscan", "PKUL", true, PKUL, false, false},
 		{"PKU3 underscan mode 3", "PKU3", false, PKU3, false, false},
-		{"PKUP underscan Plus", "PKUP", true, PKUP, true, false},
+		{"PKUP underscan Plus", "PKUP", false, PKUP, true, false},
 	}
 
 	for _, tc := range cases {
@@ -63,8 +63,12 @@ func TestParsePKSHeaderAllVariants(t *testing.T) {
 			if h.DataOffset != wantOffset {
 				t.Errorf("DataOffset = %d, want %d", h.DataOffset, wantOffset)
 			}
-			if tc.withPal && !bytes.Equal(h.Palette[:], palette) {
-				t.Errorf("palette = % x, want % x", h.Palette[:], palette)
+			if tc.withPal {
+				if !bytes.Equal(h.Palette[:], palette) {
+					t.Errorf("palette = % x, want % x", h.Palette[:], palette)
+				}
+			} else if h.Palette != ([17]byte{}) {
+				t.Errorf("palette = % x, want empty (no palette field)", h.Palette[:])
 			}
 		})
 	}
@@ -84,12 +88,13 @@ func TestPackPKSVariantRoundTrip(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		name    string
-		variant PKSVariant
+		name       string
+		variant    PKSVariant
+		wantOffset int
 	}{
-		{"PKSL", PKSL}, {"PKS3", PKS3}, {"PKSP", PKSP},
-		{"PKVL", PKVL}, {"PKVP", PKVP},
-		{"PKUL", PKUL}, {"PKU3", PKU3}, {"PKUP", PKUP},
+		{"PKSL", PKSL, 21}, {"PKS3", PKS3, 4}, {"PKSP", PKSP, 4},
+		{"PKVL", PKVL, 4}, {"PKVP", PKVP, 4},
+		{"PKUL", PKUL, 21}, {"PKU3", PKU3, 4}, {"PKUP", PKUP, 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := make([]byte, len(payload)*2+1024)
@@ -106,8 +111,15 @@ func TestPackPKSVariantRoundTrip(t *testing.T) {
 			if h.Variant != tc.variant {
 				t.Errorf("packed variant = %v, want %v", h.Variant, tc.variant)
 			}
-			if tc.variant.HasPalette() && !bytes.Equal(h.Palette[:], palette) {
-				t.Errorf("packed palette = % x, want % x", h.Palette[:], palette)
+			if h.DataOffset != tc.wantOffset {
+				t.Errorf("packed data offset = %d, want %d", h.DataOffset, tc.wantOffset)
+			}
+			if tc.variant.HasPalette() {
+				if !bytes.Equal(h.Palette[:], palette) {
+					t.Errorf("packed palette = % x, want % x", h.Palette[:], palette)
+				}
+			} else if h.Palette != ([17]byte{}) {
+				t.Errorf("packed palette = % x, want empty (no palette field)", h.Palette[:])
 			}
 
 			out := make([]byte, len(payload)+1024)
@@ -122,6 +134,59 @@ func TestPackPKSVariantRoundTrip(t *testing.T) {
 				t.Errorf("payload mismatch: got %d bytes, want %d", dn, len(payload))
 			}
 		})
+	}
+}
+
+// TestPackPKUPKeepsPlusPaletteInPayload pins the PKUP layout: no 17-byte palette
+// field (the packed data starts at offset 4) and the 33-byte CPC Plus block
+// travelling inside the packed dump, at &17D0, exactly as in a raw Plus screen.
+// A Plus palette does not fit in the 17-byte field that only the "L" variants
+// define.
+func TestPackPKUPKeepsPlusPaletteInPayload(t *testing.T) {
+	const (
+		modePalOffset = 0x17D0
+		underscanSize = 15872 // 64x192 underscan dump
+	)
+
+	payload := make([]byte, underscanSize)
+	for i := range payload {
+		payload[i] = byte(i*7 + 3)
+	}
+	// Plus block: mode byte &8C|1, then 16 &xRGB ink pairs.
+	payload[modePalOffset] = 0x8D
+	for i := 0; i < 16; i++ {
+		payload[modePalOffset+1+2*i] = 0x40
+		payload[modePalOffset+2+2*i] = byte(i)
+	}
+
+	buf := make([]byte, len(payload)*2+1024)
+	n, err := NewPKS().PackPKS(payload, len(payload), buf, PKUP, nil)
+	if err != nil {
+		t.Fatalf("PackPKS(PKUP) failed: %v", err)
+	}
+
+	h, err := ParsePKSHeader(buf[:n])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	if h.DataOffset != 4 {
+		t.Errorf("PKUP data offset = %d, want 4 (no palette field)", h.DataOffset)
+	}
+	if h.Palette != ([17]byte{}) {
+		t.Errorf("PKUP palette field = % x, want empty", h.Palette[:])
+	}
+
+	out := make([]byte, len(payload)+1024)
+	dn, _, err := NewPKS().DepackPKS(buf[:n], out)
+	if err != nil {
+		t.Fatalf("DepackPKS failed: %v", err)
+	}
+	if dn != len(payload) || !bytes.Equal(out[:dn], payload) {
+		t.Fatalf("payload mismatch after round-trip: %d bytes, want %d", dn, len(payload))
+	}
+	if out[modePalOffset] != 0x8D {
+		t.Errorf("Plus mode byte at &%04X = 0x%02X, want 0x8D (the palette travels inside the payload)",
+			modePalOffset, out[modePalOffset])
 	}
 }
 

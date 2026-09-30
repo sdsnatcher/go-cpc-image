@@ -115,14 +115,17 @@ bank) selects `PKVL`/`PKVP`, an underscan dump (a `&3E00` payload, i.e. the
 none were found at all. Naming a variant explicitly (`--method pksl`, …) skips
 the detection.
 
-**PKS palettes:** `PKSL` and `PKUL` embed a 17-byte ModePal (mode + 16 inks). By
-default `pack` takes it from the input screen's own ModePal at `&17D0`;
-`--palette` overrides it. `PKUP` has the same 17-byte field — its data starts at
-the same offset — but a CPC Plus palette does not fit there: it stays in the
-packed screen itself, so the field is empty. The other variants (`pks3`, `pksp`,
-`pkvl`, `pkvp`, `pku3`) carry no palette, so the flag is ignored with a warning.
-When the screen has no usable (non-empty) ModePal and no `--palette` is given,
-the header keeps an empty palette and a warning is printed.
+**PKS palettes:** only the `L` variants (`PKSL`, `PKUL`) embed a 17-byte ModePal
+(mode + 16 inks): their payload is column-major pixel data, so the palette has
+nowhere else to live. By default `pack` takes it from the input screen's own
+ModePal at `&17D0`; `--palette` overrides it. The other variants pack the screen
+dump as it is, palette block included — a CPC Plus palette is 33 bytes and
+travels inside that dump, at `&17D0` exactly as in the raw saves, so `pkup` needs
+no palette field and no header extension beyond its 4-byte signature. Those
+variants (`pks3`, `pksp`, `pkvl`, `pkvp`, `pku3`, `pkup`) carry no palette field,
+so the flag is ignored with a warning. When the screen has no usable (non-empty)
+ModePal and no `--palette` is given, the header keeps an empty palette and a
+warning is printed.
 
 **Rejecting already-compressed input:** `pack` refuses to re-compress data that
 is already compressed and exits with a **non-zero code** so scripts can react.
