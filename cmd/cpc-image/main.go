@@ -180,7 +180,7 @@ func init() {
 	convertCmd.Flags().IntVar(&ditherPct, "dither-pct", 50, "dithering percentage (0-100)")
 	convertCmd.Flags().StringVarP(&format, "format", "f", "scr",
 		fmt.Sprintf("output format (%s)", strings.Join(availableFormats, ", ")))
-	convertCmd.Flags().StringVar(&paletteFile, "palette", "", "lock palette from file (.pal)")
+	convertCmd.Flags().StringVar(&paletteFile, "palette", "", "lock palette from file (.pal classic, .kit CPC Plus); also overrides the SCR palette when the input is a screen")
 
 	convertCmd.MarkFlagRequired("input")
 
@@ -224,7 +224,7 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	// to the SCR -> PNG converter instead of image.Decode (which only handles
 	// PNG/JPEG/GIF).
 	if strings.ToLower(filepath.Ext(inputFile)) == ".scr" {
-		return convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr())
+		return convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr(), verbose)
 	}
 
 	// Validate mode
@@ -286,7 +286,7 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		// Not a bitmap: the file may still be a CPC SCR that lacks the .scr
 		// extension. Try the SCR -> PNG route before giving up.
-		if cvtErr := convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr()); cvtErr == nil {
+		if cvtErr := convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr(), verbose); cvtErr == nil {
 			return nil
 		}
 		return fmt.Errorf("failed to decode image: %w", err)
@@ -310,26 +310,36 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		params.NumLines = 200
 	}
 
+	// Honour a source palette, in order of priority (rule 1): an explicit
+	// --palette file wins over the palette of the source PNG, which wins over
+	// the truecolor path. The locked pens must be in place before resizeToCanvas
+	// so the pen-0 background matches the requested palette.
+	paletteLocked := false
+	if paletteFile != "" {
+		if _, perr := loadPaletteLock(paletteFile, params, plus); perr != nil {
+			return perr
+		}
+		paletteLocked = true
+		if verbose {
+			fmt.Printf("Locking palette from %s\n", paletteFile)
+		}
+	} else if applyPNGPaletteLock(img, params, cmd.ErrOrStderr()) {
+		paletteLocked = true
+	}
+
 	// Scale the source image to the CPC canvas size
 	// so that small images fill the full screen instead of only 1/4 of it
 	// (out-of-grid reads -> black). Nearest-neighbour stretch; pen-0 fills gaps.
 	directBitmap = resizeToCanvas(directBitmap, params)
 
-	// Load palette if specified
-	if paletteFile != "" {
-		if verbose {
-			fmt.Printf("Loading palette from %s\n", paletteFile)
-		}
-		// TODO: Implement palette loading from fileio package
-		// palette, err := fileio.LoadPalette(paletteFile)
-		// if err != nil {
-		//     return fmt.Errorf("failed to load palette: %w", err)
-		// }
-		// params.Palette = palette
-	}
-
 	// Create destination image
 	bitmapCpc := render.NewBitmapCpcWithParams(params.NumCols, params.NumLines, params.CpcPlus)
+	if paletteLocked {
+		// FindBestColors keeps the entries whose LockState is set and takes
+		// their colours from dest.BitmapCpc.Palette, so seed it here: the locked
+		// colours (and their pen order) must reach the SCR / PKS exactly.
+		copy(bitmapCpc.Palette[:], params.Palette[:])
+	}
 	dest := &convert.ImageCpc{
 		BitmapCpc: bitmapCpc,
 		Width:     directBitmap.Width(),
@@ -1112,6 +1122,92 @@ func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.
 	return resized
 }
 
+// loadPaletteLock loads a palette file and locks every pen it defines, so the
+// converter keeps exactly those colours (and their order) instead of choosing
+// them by pixel frequency. Both container formats are supported: a classic
+// .pal (a 239-byte payload with the ModePal block) and a CPC Plus .kit (16
+// little-endian 12-bit colours). The format follows the extension and falls
+// back to the other one, so a misnamed file still loads.
+//
+// prm.Palette[0..15] receives the colours and prm.LockState[i] is set to 1 for
+// each of the 16 pens. The mode byte kept in a .pal payload is returned so a
+// caller converting an SCR can adopt the mode the palette was saved with; a
+// .kit has no mode byte, so 0 is returned for it.
+func loadPaletteLock(path string, prm *convert.Settings, plus bool) (int, error) {
+	var pal [16]uint16
+	params := fileio.SCRParams{CPCPlus: plus}
+
+	kit := strings.EqualFold(filepath.Ext(path), ".kit")
+	if kit {
+		if err := fileio.LoadPaletteKit(path, pal[:]); err != nil {
+			return 0, fmt.Errorf("failed to load palette: %w", err)
+		}
+	} else if err := fileio.LoadPalette(path, pal[:], &params); err != nil {
+		return 0, fmt.Errorf("failed to load palette: %w", err)
+	}
+
+	for i := 0; i < 16; i++ {
+		prm.Palette[i] = int(pal[i])
+		prm.LockState[i] = 1
+	}
+	return params.VirtualMode, nil
+}
+
+// applyPNGPaletteLock honours the palette embedded in an indexed PNG. When the
+// PNG has no more entries than the selected mode supports, pen i is locked to
+// entry i, so the pen order of the source survives the conversion. An entry
+// that is not exactly representable in the target mode is snapped to the
+// nearest CPC colour (a classic ink, or a 12-bit 0x0VBR under --plus) and the
+// palette is still honoured.
+//
+// A PNG with MORE entries than the mode's pen budget cannot be represented, so
+// it is treated exactly like a truecolor image (its palette is ignored). Both
+// quality-loss events — snapping and ignoring an over-budget palette — are
+// reported on stderr, since they change the result.
+//
+// Returns true when the PNG palette was applied.
+func applyPNGPaletteLock(img image.Image, params *convert.Settings, warn io.Writer) bool {
+	paletted, ok := img.(*image.Paletted)
+	if !ok {
+		return false
+	}
+
+	budget := cpc.MaxPen(params.VirtualMode, 0, 0)
+	entries := len(paletted.Palette)
+	if entries > budget {
+		if warn != nil {
+			fmt.Fprintf(warn, "Warning: PNG palette exceeds the mode budget (%d entries > %d pens for mode %d); ignoring it and converting as truecolor\n",
+				entries, budget, params.VirtualMode)
+		}
+		return false
+	}
+
+	snapped := 0
+	for i := 0; i < entries; i++ {
+		// Palette entries come from the PNG PLTE chunk, which is opaque: use the
+		// 16-bit RGBA value, scaled back to 8 bits, to match the hardware grid.
+		r, g, b, _ := paletted.Palette[i].RGBA()
+		cr, cg, cb := uint8(r>>8), uint8(g>>8), uint8(b>>8)
+
+		var value int
+		var exact bool
+		if params.CpcPlus {
+			value, exact = cpc.NearestPlus(cr, cg, cb)
+		} else {
+			value, exact = cpc.NearestInk(cr, cg, cb)
+		}
+		if !exact {
+			snapped++
+		}
+		params.Palette[i] = value
+		params.LockState[i] = 1
+	}
+	if snapped > 0 && warn != nil {
+		fmt.Fprintf(warn, "Warning: %d palette entries snapped to the nearest CPC colour\n", snapped)
+	}
+	return true
+}
+
 // applySCRPalette parses the embedded ModePal block from the screen data and
 // populates bmp's palette. Standard SCR mode: 17-byte block at ModePalOffset
 // (mode byte + 16 ink values). Overscan: 33-byte block at 0x600. Classic mode
@@ -1180,16 +1276,17 @@ func applySCRPalette(bmp *render.BitmapCpc, screenData []byte, modeOffset int) b
 }
 
 // rgbaToIndexed converts a rendered RGBA frame into an indexed-color image
-// using 16 palette entries ordered exactly as the SCR pens.
-// Rendered pixels come from cpc.PaletteColor, so they match the palette
-// entries exactly; a nearest-color fallback guards rounding edge cases.
-func rgbaToIndexed(img *image.RGBA, bmp *render.BitmapCpc) *image.Paletted {
-	// 16 pens in the exact order of the SCR palette.
+// using 16 palette entries ordered exactly as the given pens. The palette is an
+// argument (not read from bmp) so the caller can pass an override loaded from an
+// external file. Rendered pixels come from cpc.PaletteColor, so they match the
+// palette entries exactly; a nearest-color fallback guards rounding edge cases.
+func rgbaToIndexed(img *image.RGBA, pal [16]int, plus bool) *image.Paletted {
+	// 16 pens in the exact order of the given palette.
 	palette16 := make(color.Palette, 16)
 	lookup := make(map[int]uint8, 16)
 	palRGB := make([]int, 16)
 	for i := 0; i < 16; i++ {
-		rgb := cpc.PaletteColor(bmp.Palette[i], bmp.CpcPlus)
+		rgb := cpc.PaletteColor(pal[i], plus)
 		palette16[i] = color.RGBA{R: uint8(rgb >> 16), G: uint8(rgb >> 8), B: uint8(rgb), A: 255}
 		palRGB[i] = rgb
 		if _, ok := lookup[rgb]; !ok {
@@ -1244,9 +1341,9 @@ func scrGeometry(payloadLen int) (numCol, numLig int) {
 
 // convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
 // This is the reverse direction of the normal convert command: input is .SCR,
-// output is .PNG. warn receives a warning when the screen carries no usable
-// ModePal block and the render falls back to the default CPC palette.
-func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
+// output is .PNG. warn receives the warnings and, with verbose, the note that an
+// external --palette file replaced the SCR's own ModePal.
+func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool) error {
 	data, err := os.ReadFile(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
@@ -1301,7 +1398,27 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
 	// fixed default palette returned by LoadSCR. When there is no usable
 	// block the default palette is a guess, not the screen's real one: say so
 	// instead of silently rendering a solid block.
-	if !applySCRPalette(bmp, screenData, modeOffset) && warn != nil {
+	applied := applySCRPalette(bmp, screenData, modeOffset)
+
+	// An explicit --palette overrides the ModePal carried by the screen (rules
+	// 1+2): it drives both the render and the output PLTE. Replacing the palette
+	// is not a quality loss, so the note is verbose-only (decision 3).
+	if paletteFile != "" {
+		prm := convert.NewDefaultSettings()
+		scrMode, perr := loadPaletteLock(paletteFile, prm, bmp.CpcPlus)
+		if perr != nil {
+			return perr
+		}
+		bmp.Palette = prm.Palette
+		if !applied && scrMode > 0 {
+			// No ModePal on the screen: adopt the mode the palette was saved
+			// with, otherwise the pixels would be decoded in the wrong layout.
+			bmp.VirtualMode = scrMode
+		}
+		if verbose && warn != nil {
+			fmt.Fprintf(warn, "Note: using palette from %s (SCR palette ignored)\n", paletteFile)
+		}
+	} else if !applied && warn != nil {
 		fmt.Fprintln(warn, "Warning: screen has no usable ModePal; rendering with the default CPC palette")
 	}
 
@@ -1316,7 +1433,7 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer) error {
 	}
 	defer file.Close()
 	// Indexed-color PNG whose palette follows the SCR pen order.
-	if err := png.Encode(file, rgbaToIndexed(img, bmp)); err != nil {
+	if err := png.Encode(file, rgbaToIndexed(img, bmp.Palette, bmp.CpcPlus)); err != nil {
 		return fmt.Errorf("failed to encode PNG: %w", err)
 	}
 

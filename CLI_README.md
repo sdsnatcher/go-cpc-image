@@ -32,7 +32,7 @@ cpc-image convert -i photo.png -o screen.scr -m 1
 - `-d, --dither` - Dithering method (default: `floyd-steinberg`)
 - `--dither-pct` - Dithering percentage 0-100 (default: 50)
 - `-f, --format` - Output format: scr, asm, dsk, png (default: `scr`)
-- `--palette` - Lock palette from .pal file
+- `--palette` - Lock the palette from a file: `.pal` (classic) or `.kit` (CPC Plus)
 
 **Available Dithering Methods:**
 - `floyd-steinberg` - Floyd-Steinberg error diffusion
@@ -54,7 +54,33 @@ cpc-image convert -i image.bmp -o screen.asm -f asm -m 1
 
 # Use Bayer dithering at 75%
 cpc-image convert -i pic.png -o screen.scr -d bayer2 --dither-pct 75
+
+# Lock the pens to a .pal file (pen i = entry i), instead of letting the
+# converter choose them by pixel frequency
+cpc-image convert -i pic.png -o screen.scr -m 1 --palette screen.pal
+
+# SCR -> PNG honouring an external palette instead of the one in the screen
+cpc-image convert -i screen.scr -o screen.png --palette screen.pal
 ```
+
+**Source palette handling:** `convert` honours a source palette, in this order:
+1. `--palette <file>` — the file wins, in BOTH directions (PNG→SCR and SCR→PNG).
+   Each of its 16 pens is locked, so the SCR/PKS embeds exactly those colours in
+   that order. `.pal` holds classic ink indices, `.kit` holds CPC Plus 12-bit
+   colours; the container is picked from the extension.
+2. Otherwise, an **indexed PNG** (a `PLTE`-carrying image, such as the one
+   `convert` itself writes for SCR→PNG) is honoured when it holds no more
+   entries than the selected mode supports (mode 0 → 16, 1 → 4, 2 → 2): pen i
+   takes entry i, so the pen order survives the round trip. An entry that is not
+   exactly representable is snapped to the nearest CPC colour (a classic ink, or
+   the nearest 12-bit `0x0VBR` under `--plus`) and the count is warned about.
+3. Otherwise the truecolor path is used, with the pens assigned by frequency.
+
+A PNG whose palette holds MORE entries than the mode supports cannot be
+represented: a warning is printed and the image is converted exactly like a
+truecolor one (its palette is ignored). When the input is an SCR and `--palette`
+is given, the screen's own ModePal is ignored — `-v` reports
+`using palette from <file> (SCR palette ignored)`.
 
 ### pack - Compress binary files
 

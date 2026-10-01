@@ -25,7 +25,12 @@
   - CPC Plus mode (4096 colors)
   - Dithering percentage control (0-100%)
   - Output formats (scr, asm, dsk, png)
-  - Palette locking from .pal files
+  - Palette locking from `.pal`/`.kit` files: `--palette` pins all 16 pens, in
+    both directions (PNG→SCR and SCR→PNG), and takes priority over any palette
+    found in the source
+  - Indexed PNG source palettes are honoured when they fit the mode's pen budget
+    (pen i = PLTE entry i, entries snapped to the nearest CPC colour with a
+    warning); an over-budget palette warns and falls back to the truecolor path
 - **Verbose output** with detailed conversion information
 
 #### Pack Command ✅
@@ -123,9 +128,8 @@
 
 ### High Priority (Core Functionality)
 1. **Complete SCR info extraction** using existing fileio functions
-2. **Implement palette file loading** for --palette flag
-3. **Add proper time measurement** for conversion timing
-4. **Complete PNG output** using render package
+2. **Add proper time measurement** for conversion timing
+3. **Complete PNG output** using render package
 
 ### Medium Priority (Enhanced Features)
 1. **Implement ASM generation** using asmgen package

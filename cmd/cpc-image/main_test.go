@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/png"
@@ -1465,5 +1466,643 @@ func TestCLIConvertPlusPaletteRealSamples(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F5: honouring a source palette in `convert` (indexed PNG + --palette).
+
+// resetConvertFlags clears the process-global convert flags (and the
+// persistent --verbose) that an earlier Execute() in this package may have set,
+// so each test starts from the defaults. Tests that set --plus/--overscan/-v
+// call it with defer.
+func resetConvertFlags(t *testing.T) {
+	t.Helper()
+	if err := convertCmd.Flags().Set("palette", ""); err != nil {
+		t.Fatalf("reset --palette failed: %v", err)
+	}
+	if err := convertCmd.Flags().Set("plus", "false"); err != nil {
+		t.Fatalf("reset --plus failed: %v", err)
+	}
+	if err := convertCmd.Flags().Set("overscan", "false"); err != nil {
+		t.Fatalf("reset --overscan failed: %v", err)
+	}
+	if err := rootCmd.PersistentFlags().Set("verbose", "false"); err != nil {
+		t.Fatalf("reset --verbose failed: %v", err)
+	}
+}
+
+// modePalOf reads the 17-byte ModePal block from a saved SCR file (AMSDOS
+// wrapped) and returns it.
+func modePalOf(t *testing.T, path string) []byte {
+	t.Helper()
+	data := mustRead(t, path)
+	if !cpc.CheckAmsdos(data) {
+		t.Fatalf("%s has no valid AMSDOS header", path)
+	}
+	off := 128 + cpc.ModePalOffset
+	if len(data) < off+17 {
+		t.Fatalf("%s is too small to hold a ModePal block", path)
+	}
+	return data[off : off+17]
+}
+
+// decodeIndexedPNG opens an indexed PNG and returns it as an *image.Paletted.
+func decodeIndexedPNG(t *testing.T, path string) *image.Paletted {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s failed: %v", path, err)
+	}
+	defer f.Close()
+	img, _, derr := image.Decode(f)
+	if derr != nil {
+		t.Fatalf("decode %s failed: %v", path, derr)
+	}
+	paletted, ok := img.(*image.Paletted)
+	if !ok {
+		t.Fatalf("%s decoded as %T, want an indexed image", path, img)
+	}
+	return paletted
+}
+
+// palettedRGB returns the 8-bit RGB of palette entry i.
+func palettedRGB(t *testing.T, p color.Palette, i int) color.RGBA {
+	t.Helper()
+	return color.RGBAModel.Convert(p[i]).(color.RGBA)
+}
+
+// writeIndexedPNG writes an 8-bit indexed PNG whose PLTE is exactly palette and
+// whose pixels are given by at(x, y) (a palette index).
+func writeIndexedPNG(t *testing.T, path string, palette color.Palette, w, h int, at func(x, y int) uint8) string {
+	t.Helper()
+	img := image.NewPaletted(image.Rect(0, 0, w, h), palette)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.SetColorIndex(x, y, at(x, y))
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create %s failed: %v", path, err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		f.Close()
+		t.Fatalf("encode %s failed: %v", path, err)
+	}
+	f.Close()
+	return path
+}
+
+// exactInkPalette builds an opaque color.Palette from classic CPC ink indices.
+func exactInkPalette(inks ...int) color.Palette {
+	pal := make(color.Palette, len(inks))
+	for i, ink := range inks {
+		c := cpc.CpcRgbPalette[ink]
+		pal[i] = color.RGBA{R: c.R, G: c.V, B: c.B, A: 255}
+	}
+	return pal
+}
+
+// embedPlusModePal writes a 33-byte CPC Plus ModePal block at ModePalOffset of a
+// raw screen, growing it when needed (mirrors cpc.EmbedModePal for the Plus
+// layout: mode byte with bit 7 set, then 16 low/high 0x0VBR pairs).
+func embedPlusModePal(t *testing.T, screen []byte, block []byte) []byte {
+	t.Helper()
+	if len(block) != 33 {
+		t.Fatalf("Plus ModePal block is %d bytes, want 33", len(block))
+	}
+	need := cpc.ModePalOffset + len(block)
+	if len(screen) < need {
+		grown := make([]byte, need)
+		copy(grown, screen)
+		screen = grown
+	}
+	copy(screen[cpc.ModePalOffset:], block)
+	return screen
+}
+
+// plusModePalBlock encodes a 16-entry CPC Plus palette (0x0VBR values) into the
+// 33-byte screen block the way fileio.SaveSCR writes it and applySCRPalette
+// reads it back: mode byte (mode | 0x8C) then low/high pairs with the low byte
+// B|R<<4 and the high byte V.
+func plusModePalBlock(mode int, vals [16]int) []byte {
+	block := make([]byte, 33)
+	block[0] = byte(mode | 0x8C)
+	k := 1
+	for i := 0; i < 16; i++ {
+		v := vals[i]
+		block[k] = byte(((v >> 4) & 0x0F) | ((v << 4) & 0xFF))
+		k++
+		block[k] = byte((v >> 8) & 0x0F)
+		k++
+	}
+	return block
+}
+
+// writeKIT writes a 160-byte CPC Plus .kit file (128-byte AMSDOS header + 16
+// little-endian entries) that fileio.LoadPaletteKit decodes back to the given
+// 0x0VBR values. It is written directly instead of via fileio.SavePaletteKit,
+// whose KIT encoder is fixed by a later change.
+func writeKIT(t *testing.T, path string, vals [16]int) string {
+	t.Helper()
+	entete := cpc.CreeEntete(filepath.Base(path), 0x6400, 32, 0)
+	header, err := cpc.AmsdosToByte(entete)
+	if err != nil {
+		t.Fatalf("AmsdosToByte failed: %v", err)
+	}
+	data := make([]byte, 160)
+	copy(data, header)
+	for i := 0; i < 16; i++ {
+		v := vals[i]
+		kit := ((v>>8)&0x0F)<<8 | (v&0x0F)<<4 | (v>>4)&0x0F
+		binary.LittleEndian.PutUint16(data[128+i*2:], uint16(kit))
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write KIT failed: %v", err)
+	}
+	return path
+}
+
+// TestCLIConvertPaletteFlagPNGToSCR verifies that `--palette` locks the pens of
+// a PNG -> SCR conversion to the order stored in the .pal file, instead of the
+// frequency order the truecolor path would pick. The source is dominated by
+// white but the .pal asks for ink 1 (blue) on pen 0, so the two orders cannot be
+// confused.
+func TestCLIConvertPaletteFlagPNGToSCR(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// 4 exact CPC colours; white covers most of the canvas.
+	white := cpc.CpcRgbPalette[26]
+	blue := cpc.CpcRgbPalette[1]
+	red := cpc.CpcRgbPalette[6]
+	yellow := cpc.CpcRgbPalette[24]
+	src := image.NewRGBA(image.Rect(0, 0, 640, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 640; x++ {
+			c := white
+			switch {
+			case x >= 630:
+				c = yellow
+			case x >= 620:
+				c = red
+			case x >= 600:
+				c = blue
+			}
+			src.Set(x, y, color.RGBA{R: c.R, G: c.V, B: c.B, A: 255})
+		}
+	}
+	srcPath := writeRGBA(t, tempDir, "src.png", src)
+
+	// The .pal starts with the rarest colour, so pen 0 differs from frequency.
+	pal := [16]uint16{1, 24, 20, 6, 26, 0, 2, 7, 10, 12, 14, 16, 18, 22, 1, 14}
+	palPath := filepath.Join(tempDir, "lock.pal")
+	if err := fileio.SavePalette(palPath, pal[:], fileio.SCRParams{VirtualMode: 0}); err != nil {
+		t.Fatalf("SavePalette failed: %v", err)
+	}
+
+	// Without --palette the pens follow frequency: pen 0 gets the most common
+	// colour (white, ink 26).
+	freqPath := filepath.Join(tempDir, "freq.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", freqPath, "-m", "0", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert (truecolor) failed: %v", err)
+	}
+	if got := modePalOf(t, freqPath); got[1] != 26 {
+		t.Errorf("without --palette pen 0 ink = %d, want 26 (the most frequent colour)", got[1])
+	}
+
+	// With --palette the file's order wins, verbatim, over all 16 pens.
+	lockedPath := filepath.Join(tempDir, "locked.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", lockedPath, "-m", "0", "-d", "none", "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert --palette failed: %v", err)
+	}
+	want := make([]byte, 17)
+	want[0] = 0 // mode 0, from -m
+	for i, ink := range pal {
+		want[1+i] = byte(ink)
+	}
+	if got := modePalOf(t, lockedPath); !bytes.Equal(got, want) {
+		t.Errorf("locked ModePal = % x, want % x", got, want)
+	}
+}
+
+// TestCLIConvertPaletteFlagSCRToPNG verifies that `--palette` overrides the
+// ModePal embedded in an SCR when converting to PNG: the output PLTE must be the
+// .pal colours, and the "SCR palette ignored" note must appear only with
+// --verbose (it is not a quality loss).
+func TestCLIConvertPaletteFlagSCRToPNG(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// The screen carries its own (different) ModePal: mode 1, all white pens.
+	scrPal := []byte{1, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26}
+	screen := cpc.EmbedModePal(mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)), scrPal)
+	scrPath := filepath.Join(tempDir, "screen.scr")
+	if err := os.WriteFile(scrPath, screen, 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	// The override palette has a distinctive, easily checked order.
+	override := [16]uint16{0, 24, 20, 6, 26, 0, 2, 7, 10, 12, 14, 16, 18, 22, 1, 14}
+	palPath := filepath.Join(tempDir, "override.pal")
+	if err := fileio.SavePalette(palPath, override[:], fileio.SCRParams{VirtualMode: 1}); err != nil {
+		t.Fatalf("SavePalette failed: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+
+	// Default run: the note must be silent.
+	defaultOut := filepath.Join(tempDir, "default.png")
+	rootCmd.SetArgs([]string{"convert", "-i", scrPath, "-o", defaultOut, "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert SCR -> PNG failed: %v", err)
+	}
+	if strings.Contains(stderr.String(), "SCR palette ignored") {
+		t.Errorf("override note printed without --verbose: %q", stderr.String())
+	}
+
+	paletted := decodeIndexedPNG(t, defaultOut)
+	if len(paletted.Palette) != 16 {
+		t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+	}
+	for pen := 0; pen < 16; pen++ {
+		want := cpc.PaletteColor(int(override[pen]), false)
+		got := palettedRGB(t, paletted.Palette, pen)
+		if int(got.R) != (want>>16)&0xFF || int(got.G) != (want>>8)&0xFF || int(got.B) != want&0xFF {
+			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (ink %d)",
+				pen, got.R, got.G, got.B, want, override[pen])
+		}
+	}
+
+	// With --verbose the informational note is printed.
+	stderr.Reset()
+	verboseOut := filepath.Join(tempDir, "verbose.png")
+	rootCmd.SetArgs([]string{"convert", "-i", scrPath, "-o", verboseOut, "--palette", palPath, "-v"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert SCR -> PNG -v failed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "using palette from") || !strings.Contains(stderr.String(), "SCR palette ignored") {
+		t.Errorf("missing verbose override note, got: %q", stderr.String())
+	}
+}
+
+// TestCLIConvertPaletteFlagSCRToPNGPlus verifies the CPC Plus side of the SCR ->
+// PNG override: a .kit file replaces the Plus ModePal of the screen, and the
+// output PLTE holds the .kit's 12-bit colours.
+func TestCLIConvertPaletteFlagSCRToPNGPlus(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// A CPC Plus screen (mode byte with bit 7 set) with its own Plus block.
+	scrVals := [16]int{}
+	for i := range scrVals {
+		scrVals[i] = 0xFFF // all-white pens, clearly different from the .kit
+	}
+	screen := embedPlusModePal(t, mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)),
+		plusModePalBlock(1, scrVals))
+	scrPath := filepath.Join(tempDir, "plus.scr")
+	if err := os.WriteFile(scrPath, screen, 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	// 16 distinct 12-bit colours in the .kit.
+	kitVals := [16]int{}
+	for i := range kitVals {
+		kitVals[i] = (i << 8) | ((15 - i) << 4) | i
+	}
+	kitPath := writeKIT(t, filepath.Join(tempDir, "override.kit"), kitVals)
+
+	outPath := filepath.Join(tempDir, "out.png")
+	rootCmd.SetArgs([]string{"convert", "-i", scrPath, "-o", outPath, "--palette", kitPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert Plus SCR -> PNG failed: %v", err)
+	}
+
+	paletted := decodeIndexedPNG(t, outPath)
+	if len(paletted.Palette) != 16 {
+		t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+	}
+	for pen := 0; pen < 16; pen++ {
+		want := cpc.PaletteColor(kitVals[pen], true)
+		got := palettedRGB(t, paletted.Palette, pen)
+		if int(got.R) != (want>>16)&0xFF || int(got.G) != (want>>8)&0xFF || int(got.B) != want&0xFF {
+			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (0x0VBR 0x%03X)",
+				pen, got.R, got.G, got.B, want, kitVals[pen])
+		}
+	}
+}
+
+// TestCLIConvertIndexedPNGPaletteHonoured verifies that an indexed PNG whose
+// entry count fits the mode budget is honoured: pen i takes PLTE entry i, so the
+// pen order of the source survives into the SCR ModePal.
+func TestCLIConvertIndexedPNGPaletteHonoured(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// Mode 1 supports 4 pens; give the PNG exactly 4 entries, in a non-obvious
+	// order (blue, red, yellow, white).
+	inks := []int{1, 6, 24, 26}
+	pal := exactInkPalette(inks...)
+	srcPath := writeIndexedPNG(t, filepath.Join(tempDir, "indexed.png"), pal, 640, 400,
+		func(x, y int) uint8 { return uint8(x / 160) })
+
+	scrPath := filepath.Join(tempDir, "out.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", scrPath, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert indexed PNG -> SCR failed: %v", err)
+	}
+
+	got := modePalOf(t, scrPath)
+	if got[0] != 1 {
+		t.Errorf("ModePal mode byte = %d, want 1", got[0])
+	}
+	for pen, ink := range inks {
+		if int(got[1+pen]) != ink {
+			t.Errorf("pen %d ink = %d, want %d (PLTE order must be preserved)", pen, got[1+pen], ink)
+		}
+	}
+	// Mode 1 only defines 4 pens: the rest stay marked unused.
+	for pen := len(inks); pen < 16; pen++ {
+		if got[1+pen] != 0xFF {
+			t.Errorf("pen %d ink = %d, want 0xFF (unused in mode 1)", pen, got[1+pen])
+		}
+	}
+}
+
+// TestCLIConvertIndexedPNGSnapping verifies that a PNG palette entry which is not
+// an exact CPC colour is snapped to the nearest one (classic ink, or 12-bit
+// 0x0VBR under --plus) instead of falling back to truecolor, and that the
+// quality loss is reported on stderr by default.
+func TestCLIConvertIndexedPNGSnapping(t *testing.T) {
+	t.Run("classic", func(t *testing.T) {
+		tempDir := t.TempDir()
+		defer resetConvertFlags(t)
+
+		// Entry 0 is a dirty red (not a hardware colour) -> snaps to ink 6;
+		// entry 1 is exact black. The order must survive.
+		pal := color.Palette{
+			color.RGBA{R: 0xFA, G: 0x05, B: 0x05, A: 255},
+			color.RGBA{R: 0x00, G: 0x00, B: 0x00, A: 255},
+		}
+		srcPath := writeIndexedPNG(t, filepath.Join(tempDir, "snap.png"), pal, 640, 400,
+			func(x, y int) uint8 { return uint8(x / 320) })
+
+		var stderr bytes.Buffer
+		rootCmd.SetErr(&stderr)
+		defer rootCmd.SetErr(os.Stderr)
+
+		scrPath := filepath.Join(tempDir, "out.scr")
+		rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", scrPath, "-m", "1", "-d", "none"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("convert indexed PNG -> SCR failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "palette entries snapped") {
+			t.Errorf("snapping must warn by default, got: %q", stderr.String())
+		}
+
+		got := modePalOf(t, scrPath)
+		if got[1] != 6 || got[2] != 0 {
+			t.Errorf("snapped pens = [%d %d], want [6 0] (nearest ink, PLTE order kept)", got[1], got[2])
+		}
+	})
+
+	t.Run("plus", func(t *testing.T) {
+		tempDir := t.TempDir()
+		defer resetConvertFlags(t)
+
+		// Under --plus the same dirty red snaps to the nearest 0x0VBR colour.
+		pal := color.Palette{
+			color.RGBA{R: 0xFA, G: 0x05, B: 0x05, A: 255},
+			color.RGBA{R: 0x00, G: 0x00, B: 0x00, A: 255},
+		}
+		srcPath := writeIndexedPNG(t, filepath.Join(tempDir, "snap_plus.png"), pal, 640, 400,
+			func(x, y int) uint8 { return uint8(x / 320) })
+
+		var stderr bytes.Buffer
+		rootCmd.SetErr(&stderr)
+		defer rootCmd.SetErr(os.Stderr)
+
+		scrPath := filepath.Join(tempDir, "out.scr")
+		rootCmd.SetArgs([]string{"convert", "-i", srcPath, "-o", scrPath, "-m", "1", "--plus", "-d", "none"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("convert indexed PNG -> SCR --plus failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "palette entries snapped") {
+			t.Errorf("snapping must warn by default, got: %q", stderr.String())
+		}
+
+		snappedRed, _ := cpc.NearestPlus(0xFA, 0x05, 0x05)
+		wantPens := [16]int{snappedRed, 0x000}
+		want := plusModePalBlock(1, wantPens)
+		got := modePalOfPlus(t, scrPath)
+		if !bytes.Equal(got[:2], want[:2]) {
+			t.Errorf("Plus ModePal mode byte = 0x%02X, want 0x%02X", got[0], want[0])
+		}
+		if !bytes.Equal(got[1:5], want[1:5]) {
+			t.Errorf("snapped Plus pens = % x, want % x", got[1:5], want[1:5])
+		}
+	})
+}
+
+// modePalOfPlus reads the 33-byte CPC Plus ModePal block from a saved SCR file
+// (AMSDOS wrapped) and returns it.
+func modePalOfPlus(t *testing.T, path string) []byte {
+	t.Helper()
+	data := mustRead(t, path)
+	if !cpc.CheckAmsdos(data) {
+		t.Fatalf("%s has no valid AMSDOS header", path)
+	}
+	off := 128 + cpc.ModePalOffset
+	if len(data) < off+33 {
+		t.Fatalf("%s is too small to hold a Plus ModePal block", path)
+	}
+	return data[off : off+33]
+}
+
+// TestCLIConvertIndexedPNGOverBudget verifies rule 3: an indexed PNG with more
+// entries than the selected mode supports cannot be represented, so it is
+// treated exactly like a truecolor image (its palette is ignored) and the
+// quality loss is warned about on stderr.
+func TestCLIConvertIndexedPNGOverBudget(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// 8 distinct CPC colours, one per stripe.
+	inks := []int{0, 1, 6, 13, 20, 24, 25, 26}
+	pal := exactInkPalette(inks...)
+	stripe := func(x, y int) uint8 { return uint8(x / 80) }
+
+	// The same picture twice: once as an 8-entry indexed PNG (over the 4-pen
+	// budget of mode 1), once as truecolor.
+	indexedPath := writeIndexedPNG(t, filepath.Join(tempDir, "over.png"), pal, 640, 400, stripe)
+	truecolor := image.NewRGBA(image.Rect(0, 0, 640, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 640; x++ {
+			c := cpc.CpcRgbPalette[inks[x/80]]
+			truecolor.Set(x, y, color.RGBA{R: c.R, G: c.V, B: c.B, A: 255})
+		}
+	}
+	truecolorPath := writeRGBA(t, tempDir, "over_truecolor.png", truecolor)
+
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+
+	indexedSCR := filepath.Join(tempDir, "indexed.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", indexedPath, "-o", indexedSCR, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert over-budget indexed PNG failed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "exceeds the mode budget") {
+		t.Errorf("over-budget palette must warn, got: %q", stderr.String())
+	}
+
+	stderr.Reset()
+	truecolorSCR := filepath.Join(tempDir, "truecolor.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", truecolorPath, "-o", truecolorSCR, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert truecolor PNG failed: %v", err)
+	}
+	if strings.Contains(stderr.String(), "exceeds the mode budget") {
+		t.Errorf("truecolor input must not warn about a palette budget, got: %q", stderr.String())
+	}
+
+	// Compare the payloads: the 128-byte AMSDOS header carries the output file
+	// name, which differs between the two runs.
+	a, b := mustRead(t, indexedSCR), mustRead(t, truecolorSCR)
+	if !bytes.Equal(a[128:], b[128:]) {
+		t.Error("an over-budget indexed PNG must produce exactly the truecolor result")
+	}
+}
+
+// TestCLIConvertIndexedPNGEntryCount verifies that rule 3 counts palette ENTRIES
+// and not the entries the pixels actually use: a 256-entry indexed PNG whose
+// pixels reference only two of them must still be rejected as over budget.
+func TestCLIConvertIndexedPNGEntryCount(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// 256 entries, only 0 (black) and 1 (white) ever referenced.
+	pal := make(color.Palette, 256)
+	for i := range pal {
+		pal[i] = color.RGBA{R: uint8(i), G: uint8(255 - i), B: uint8(i), A: 255}
+	}
+	pal[0] = color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	pal[1] = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	indexedPath := writeIndexedPNG(t, filepath.Join(tempDir, "many.png"), pal, 640, 400,
+		func(x, y int) uint8 {
+			if (x/8)%2 == 0 {
+				return 0
+			}
+			return 1
+		})
+
+	// The equivalent truecolor picture (black/white stripes).
+	truecolor := image.NewRGBA(image.Rect(0, 0, 640, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 640; x++ {
+			v := uint8(0)
+			if (x/8)%2 != 0 {
+				v = 255
+			}
+			truecolor.Set(x, y, color.RGBA{R: v, G: v, B: v, A: 255})
+		}
+	}
+	truecolorPath := writeRGBA(t, tempDir, "two_truecolor.png", truecolor)
+
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+
+	indexedSCR := filepath.Join(tempDir, "many.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", indexedPath, "-o", indexedSCR, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert 256-entry indexed PNG failed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "exceeds the mode budget") {
+		t.Errorf("a 256-entry palette must warn even when 2 entries are used, got: %q", stderr.String())
+	}
+
+	stderr.Reset()
+	truecolorSCR := filepath.Join(tempDir, "two_truecolor.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", truecolorPath, "-o", truecolorSCR, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert truecolor PNG failed: %v", err)
+	}
+	// Compare the payloads: the AMSDOS header carries the output file name.
+	a, b := mustRead(t, indexedSCR), mustRead(t, truecolorSCR)
+	if !bytes.Equal(a[128:], b[128:]) {
+		t.Error("an over-budget indexed PNG must produce exactly the truecolor result")
+	}
+}
+
+// TestCLIConvertPaletteRoundTripPenExact verifies the goal of F5: an SCR -> PNG
+// -> SCR round trip keeps the pen order of the original when --palette pins it,
+// while the same round trip without the flag does not (today's behaviour, which
+// re-derives the pens by frequency).
+func TestCLIConvertPaletteRoundTripPenExact(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// Original screen: mode 1, four distinct inks in a known order.
+	original := []byte{1, 0, 6, 24, 26, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+	screen := cpc.EmbedModePal(mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)), original)
+	scrPath := filepath.Join(tempDir, "original.scr")
+	if err := os.WriteFile(scrPath, screen, 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	// The matching .pal (same inks, same order).
+	palPath := filepath.Join(tempDir, "screen.pal")
+	pal := make([]uint16, 16)
+	for i := 0; i < 16; i++ {
+		pal[i] = uint16(original[1+i])
+	}
+	if err := fileio.SavePalette(palPath, pal, fileio.SCRParams{VirtualMode: 1}); err != nil {
+		t.Fatalf("SavePalette failed: %v", err)
+	}
+
+	// SCR -> PNG (the palette override drives the render and the PLTE).
+	backPath := filepath.Join(tempDir, "back.png")
+	rootCmd.SetArgs([]string{"convert", "-i", scrPath, "-o", backPath, "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert SCR -> PNG failed: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+
+	// PNG -> SCR with --palette reproduces the original pen order exactly.
+	lockedPath := filepath.Join(tempDir, "locked.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", backPath, "-o", lockedPath, "-m", "1", "-d", "none", "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert PNG -> SCR --palette failed: %v", err)
+	}
+	locked := modePalOf(t, lockedPath)
+	// Mode 1 only defines 4 pens, and a classic .pal cannot express "unused"
+	// (it stores ink indices 0..26), so compare the mode byte and those 4 pens.
+	if !bytes.Equal(locked[:5], original[:5]) {
+		t.Errorf("round trip with --palette = % x, want % x", locked[:5], original[:5])
+	}
+
+	// Without the flag the F1 indexed PNG (16 entries in mode 1) is over budget,
+	// so the pens are re-derived by frequency: the order is not preserved.
+	// (--palette is a process-global: clear it, otherwise the previous run's
+	// value would still be in effect.)
+	stderr.Reset()
+	resetConvertFlags(t)
+	plainPath := filepath.Join(tempDir, "plain.scr")
+	rootCmd.SetArgs([]string{"convert", "-i", backPath, "-o", plainPath, "-m", "1", "-d", "none"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert PNG -> SCR failed: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "exceeds the mode budget") {
+		t.Errorf("without --palette the 16-entry PNG must be over budget, got: %q", stderr.String())
 	}
 }
