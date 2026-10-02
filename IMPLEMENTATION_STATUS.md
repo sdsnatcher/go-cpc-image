@@ -36,10 +36,15 @@
 #### Pack Command ✅
 - **Compression methods:** zx0, zx0v2, zx1, lzw, and the PKS family (pks, pksl,
   pks3, pksp, pkvl, pkvp, pkul, pku3, pkup)
-- **PKS palette embedding:** `--palette <file.pal>` overrides the ModePal found
-  in the input screen (PKSL and PKUL, the only variants with a 17-byte palette
-  field; the others carry no field — a CPC Plus palette travels inside the packed
-  screen — so the flag is ignored with a warning)
+- **PKS palette embedding:** `--palette` takes a `.pal` (classic ink indices) or a
+  `.kit` (CPC Plus 12-bit colours) and overrides the palette found in the input
+  screen. The classic "L" variants (PKSL, PKUL) store it in their 17-byte header
+  field; the CPC Plus variants (PKSP, PKVP, PKUP) have no field, so the 33-byte
+  block is written into the packed screen dump at `&17D0` (`&600` for overscan)
+  before compressing and comes back byte for byte when unpacking. The remaining
+  variants (PKS3, PKU3, PKVL) carry no palette at all, so the flag is ignored with
+  a warning. Either container can drive either kind of screen — colours are
+  converted between the 27 hardware inks and 12-bit colours as needed.
 - **PKS variant auto-detection:** `--method pks` picks the variant from the input
   screen (overscan load address `&0200` or a 16K payload → `PKVL`/`PKVP`; a
   64x192 underscan payload → `PKUL`/`PKU3`/`PKUP`; the `0x80` bit of the mode

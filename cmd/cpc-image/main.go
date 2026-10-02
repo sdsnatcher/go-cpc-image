@@ -574,34 +574,66 @@ func runPack(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// The classic variants (PKSL, PKUL) carry a 17-byte ModePal (mode + 16
-		// inks). An explicit --palette file wins over the one embedded in the
-		// input screen; when neither is available the header keeps 17 zero bytes.
-		var palette []byte
+		// Palette plumbing. A classic "L" variant (PKSL, PKUL) carries a 17-byte
+		// ModePal field in its header, because its payload is column-major pixel
+		// data with nowhere else to keep a palette. A CPC Plus variant (PKSP,
+		// PKVP, PKUP) instead keeps its 33-byte block inside the packed screen
+		// dump, exactly where a raw screen has it (&17D0, or &600 for overscan),
+		// so `pack` injects the block into the dump before compressing. The
+		// remaining variants (PKS3, PKU3, PKVL) have no palette field at all and
+		// pack the dump as it is.
+		var palette []byte   // 17-byte PKSL/PKUL header field
+		var plusBlock []byte // 33-byte block written into the dump
+		overscan, _, _ := pksVariantSignals(bitmap, amsAddr)
+
 		switch {
-		case !pksVariantEmbedsModePal(variant):
+		case pksVariantIsPlus(variant):
 			if paletteFile != "" {
-				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s carries no palette; --palette ignored\n",
-					strings.ToUpper(compressionMethod))
-			}
-		case paletteFile != "":
-			palData, palErr := loadPaletteBytes(paletteFile)
-			if palErr != nil {
-				return fmt.Errorf("failed to load palette: %w", palErr)
-			}
-			palette = palData
-			if verbose {
-				fmt.Printf("Using palette from %s (mode=%d)\n", paletteFile, palData[0])
-			}
-		default:
-			if pal := cpc.ExtractModePal(bitmap); pal != nil && anyNonZero(pal) {
-				palette = pal
+				block, palErr := loadPaletteBytes(paletteFile, pksScreenMode(bitmap, overscan), true)
+				if palErr != nil {
+					return fmt.Errorf("failed to load palette: %w", palErr)
+				}
+				plusBlock = block
 				if verbose {
-					fmt.Printf("Using embedded ModePal from screen (mode=%d)\n", pal[0])
+					fmt.Printf("Using CPC Plus palette from %s (mode=%d, written into the packed dump)\n",
+						paletteFile, plusBlock[0]&0x03)
+				}
+			} else if block := cpc.ExtractModePal(bitmap); len(block) == 33 && anyNonZero(block[1:]) {
+				if verbose {
+					fmt.Printf("Using embedded Plus ModePal from screen (mode=%d)\n", block[0]&0x03)
 				}
 			} else {
 				fmt.Fprintln(cmd.ErrOrStderr(),
-					"Warning: input screen has no usable ModePal; use --palette <file.pal> to embed one (header palette left empty)")
+					"Warning: input screen has no usable Plus palette; use --palette <file.kit> to embed one (the packed dump keeps its own block)")
+			}
+
+		case pksVariantEmbedsModePal(variant):
+			switch {
+			case paletteFile != "":
+				palData, palErr := loadPaletteBytes(paletteFile, pksScreenMode(bitmap, overscan), false)
+				if palErr != nil {
+					return fmt.Errorf("failed to load palette: %w", palErr)
+				}
+				palette = palData
+				if verbose {
+					fmt.Printf("Using palette from %s (mode=%d)\n", paletteFile, palData[0])
+				}
+			default:
+				if pal := cpc.ExtractClassicModePal(bitmap); pal != nil && anyNonZero(pal) {
+					palette = pal
+					if verbose {
+						fmt.Printf("Using embedded ModePal from screen (mode=%d)\n", pal[0])
+					}
+				} else {
+					fmt.Fprintln(cmd.ErrOrStderr(),
+						"Warning: input screen has no usable ModePal; use --palette <file.pal> to embed one (header palette left empty)")
+				}
+			}
+
+		default:
+			if paletteFile != "" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s carries no palette; --palette ignored\n",
+					strings.ToUpper(compressionMethod))
 			}
 		}
 
@@ -611,8 +643,11 @@ func runPack(cmd *cobra.Command, args []string) error {
 		// the standard 80x200 column-major layout, the underscan image sitting
 		// inside that frame.
 		packInput := bitmap
+		if len(plusBlock) == 33 {
+			packInput = cpc.EmbedModePalAt(bitmap, plusModePalOffset(overscan), plusBlock)
+		}
 		if _, columnMajor := pksColumnMajorPayload(variant); columnMajor {
-			packInput = cpc.ScreenToColumnMajor(bitmap, cpc.StandardCols, cpc.StandardLines)
+			packInput = cpc.ScreenToColumnMajor(packInput, cpc.StandardCols, cpc.StandardLines)
 		}
 		packedInputSize = len(packInput)
 
@@ -826,19 +861,106 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// loadPaletteBytes loads a .pal file and returns the 17-byte ModePal (mode +
-// 16 ink values) to embed in a PKS header. Ink values are classic CPC indices.
-func loadPaletteBytes(filename string) ([]byte, error) {
+// loadPaletteBytes loads a palette file and returns the ModePal block to store
+// with it: 17 bytes (mode + 16 classic ink indices) for a classic screen, or 33
+// bytes (0x8C|mode + 16 low/high 12-bit pairs) for a CPC Plus one.
+//
+// The container decides how a file is decoded — a .kit holds CPC Plus 12-bit
+// colours, a .pal holds classic ink indices — and the colours are converted when
+// they do not match the target precision, so either container can drive either
+// kind of screen. A .kit is recognised by its extension, and also by its size
+// (158 or 160 bytes), so a misnamed file still loads.
+//
+// mode is the mode stamped into the block's mode byte; a .pal overrides it with
+// the mode its payload records, the rule the classic header field has always
+// followed.
+func loadPaletteBytes(filename string, mode int, plus bool) ([]byte, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	isKIT := strings.EqualFold(filepath.Ext(filename), ".kit") || len(data) == 158 || len(data) == 160
+
+	if isKIT && plus {
+		// The block's 16 low/high pairs are, by convention, the .kit payload
+		// bytes verbatim (measured against the reference screens), so they are
+		// copied as they are. Decoding to 12-bit first would lose the 0xFFFF
+		// "unused pen" marker, which is not a colour.
+		return kitPlusBlock(data, mode)
+	}
+
 	pal := make([]uint16, 16)
-	params := fileio.SCRParams{}
-	if err := fileio.LoadPalette(filename, pal, &params); err != nil {
-		return nil, err
+	if isKIT {
+		if err := fileio.LoadPaletteKit(filename, pal); err != nil {
+			return nil, err
+		}
+	} else {
+		params := fileio.SCRParams{}
+		if err := fileio.LoadPalette(filename, pal, &params); err != nil {
+			return nil, err
+		}
+		// A .pal payload holds the screen mode it was saved with.
+		mode = params.VirtualMode & 0x03
 	}
+
+	if plus {
+		// 33-byte CPC Plus block: mode byte (bit 7 set) then 16 low/high pairs,
+		// i.e. lo = (R<<4)|B and hi = V, the very packing SaveSCR writes.
+		out := make([]byte, 33)
+		out[0] = byte(mode&0x03) | 0x8C
+		for i, v := range pal {
+			// Classic ink indices, because a .kit never reaches this point:
+			// every one of the 27 hardware colours is exactly representable in
+			// 12 bits, so this conversion is lossless.
+			rgb := cpc.PaletteColor(int(v), false)
+			plusVal, _ := cpc.NearestPlus(uint8(rgb>>16), uint8(rgb>>8), uint8(rgb))
+			v = uint16(plusVal)
+			out[1+i*2] = byte(((v >> 4) & 0x0F) | ((v << 4) & 0xF0))
+			out[2+i*2] = byte((v >> 8) & 0x0F)
+		}
+		return out, nil
+	}
+
+	// Classic 17-byte block (mode + 16 ink indices).
 	out := make([]byte, 17)
-	out[0] = byte(params.VirtualMode & 0x03)
-	for i := 0; i < 16; i++ {
-		out[1+i] = byte(pal[i])
+	out[0] = byte(mode & 0x03)
+	for i, v := range pal {
+		if isKIT {
+			// 12-bit colours have to be snapped onto the 27 hardware inks.
+			rgb := cpc.PaletteColor(int(v), true)
+			ink, _ := cpc.NearestInk(uint8(rgb>>16), uint8(rgb>>8), uint8(rgb))
+			v = uint16(ink)
+		}
+		out[1+i] = byte(v)
 	}
+	return out, nil
+}
+
+// kitPlusBlock builds the 33-byte CPC Plus ModePal block of a .kit file from its
+// raw payload, which already holds the 16 low/high pairs in the on-screen order.
+// A 158-byte .kit carries only 15 words — pens 1..15, exactly as
+// fileio.LoadPaletteKit reads them — so pen 0 is left at zero there, like the
+// loader does.
+func kitPlusBlock(data []byte, mode int) ([]byte, error) {
+	if len(data) != 158 && len(data) != 160 {
+		return nil, fmt.Errorf("invalid KIT file size: %d, expected 158 or 160", len(data))
+	}
+	if !cpc.CheckAmsdos(data) {
+		return nil, fmt.Errorf("invalid KIT file: bad AMSDOS header")
+	}
+
+	out := make([]byte, 33)
+	out[0] = byte(mode&0x03) | 0x8C
+
+	words := data[128:]
+	if len(words) > 32 {
+		words = words[:32]
+	}
+	start := 1 // 158-byte layout: no word for pen 0
+	if len(words) == 32 {
+		start = 0
+	}
+	copy(out[1+start*2:], words)
 	return out, nil
 }
 
@@ -858,9 +980,9 @@ func anyNonZero(b []byte) bool {
 // screen. haveMode is false when the dump is too short to hold that byte.
 func pksVariantSignals(bitmap []byte, amsAddr uint16) (overscan bool, modeByte byte, haveMode bool) {
 	overscan = (amsAddr == 0x0200) || (amsAddr == 0 && len(bitmap) >= 0x4000)
-	modeOffset := cpc.ModePalOffset // 0x17D0
+	modeOffset := cpc.ModePalOffset
 	if overscan {
-		modeOffset = 0x600
+		modeOffset = cpc.OverscanModePalOffset
 	}
 	if modeOffset < len(bitmap) {
 		return overscan, bitmap[modeOffset], true
@@ -899,8 +1021,10 @@ func detectPKSVariant(bitmap []byte, amsAddr uint16) (compress.PKSVariant, int) 
 		return compress.PKUP, confidence
 	}
 	// Mode 3 is only chosen when there is certainty: the byte at 0x17D0 is 3
-	// AND the whole 17-byte block validates as a ModePal.
-	if mode == 3 && cpc.ExtractModePal(bitmap) != nil {
+	// AND the whole 17-byte block validates as a classic ModePal. A CPC Plus
+	// screen (bit 7 set) is handled above by the PKSP/PKVP/PKUP branches, so
+	// the Plus block must not satisfy this classic-only check.
+	if mode == 3 && cpc.ExtractClassicModePal(bitmap) != nil {
 		if underscan {
 			return compress.PKU3, 2
 		}
@@ -943,6 +1067,41 @@ func pksColumnMajorPayload(variant compress.PKSVariant) (screenSize int, columnM
 		return cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines), true
 	}
 	return 0, false
+}
+
+// pksVariantIsPlus reports whether a variant packs a CPC Plus screen. Those
+// variants have no palette field in their header: the 33-byte Plus block travels
+// inside the screen dump itself, at &17D0 (&600 for overscan), so `pack` writes
+// it there before compressing instead of into the header.
+func pksVariantIsPlus(variant compress.PKSVariant) bool {
+	switch variant {
+	case compress.PKSP, compress.PKVP, compress.PKUP:
+		return true
+	}
+	return false
+}
+
+// plusModePalOffset returns where a CPC Plus ModePal block lives inside a screen
+// dump: &17D0 for standard and underscan dumps and &600 for overscan ones — the
+// same slot fileio.SaveSCR writes and applySCRPalette reads.
+func plusModePalOffset(overscan bool) int {
+	if overscan {
+		return cpc.OverscanModePalOffset
+	}
+	return cpc.ModePalOffset
+}
+
+// pksScreenMode returns the CPC screen mode (0..3) a dump declares in its
+// ModePal byte: 0x8C|mode for a CPC Plus screen and a plain mode for a classic
+// one. The answer is 0 when the block is absent — a dump whose palette is kept
+// in a separate file, like the corpus' raw+kit screens — since nothing else in
+// the file records the mode.
+func pksScreenMode(bitmap []byte, overscan bool) int {
+	off := plusModePalOffset(overscan)
+	if off >= len(bitmap) {
+		return 0
+	}
+	return int(bitmap[off]) & 0x03
 }
 
 // pksVariantName returns a human-readable name for a PKS variant.

@@ -95,7 +95,7 @@ cpc-image pack -i data.bin -o data.zx0 --method zx0
 - `-i, --input` - Input binary file (required)
 - `-o, --output` - Output file (required)
 - `--method` - Compression method (default: `zx0`)
-- `--palette` - Palette file (`.pal`) to embed in the PKSL header
+- `--palette` - Palette file to embed: a `.pal` (classic) or a `.kit` (CPC Plus)
 
 **Available Compression Methods:**
 - `zx0` - ZX0 optimal compression
@@ -141,17 +141,27 @@ bank) selects `PKVL`/`PKVP`, an underscan dump (a `&3E00` payload, i.e. the
 none were found at all. Naming a variant explicitly (`--method pksl`, …) skips
 the detection.
 
-**PKS palettes:** only the `L` variants (`PKSL`, `PKUL`) embed a 17-byte ModePal
-(mode + 16 inks): their payload is column-major pixel data, so the palette has
-nowhere else to live. By default `pack` takes it from the input screen's own
-ModePal at `&17D0`; `--palette` overrides it. The other variants pack the screen
-dump as it is, palette block included — a CPC Plus palette is 33 bytes and
-travels inside that dump, at `&17D0` exactly as in the raw saves, so `pkup` needs
-no palette field and no header extension beyond its 4-byte signature. Those
-variants (`pks3`, `pksp`, `pkvl`, `pkvp`, `pku3`, `pkup`) carry no palette field,
-so the flag is ignored with a warning. When the screen has no usable (non-empty)
-ModePal and no `--palette` is given, the header keeps an empty palette and a
-warning is printed.
+**PKS palettes:** `--palette` accepts a `.pal` (classic ink indices) or a `.kit`
+(CPC Plus 12-bit colours); the container decides how the file is decoded, and
+either one can drive either kind of screen.
+
+- The classic `L` variants (`PKSL`, `PKUL`) embed a 17-byte ModePal field
+  (mode + 16 inks): their payload is column-major pixel data, so the palette has
+  nowhere else to live. By default `pack` takes it from the input screen's own
+  ModePal at `&17D0`; `--palette` overrides it.
+- The CPC Plus variants (`PKSP`, `PKVP`, `PKUP`) have no palette field at all:
+  their 33-byte block travels inside the packed screen dump, at `&17D0` exactly
+  as a raw save keeps it (`&600` for overscan). `--palette <file.kit>` writes that
+  block into the dump before compressing, so unpacking restores it byte for byte —
+  the `0xFFFF` "unused pen" markers included. Without the flag the screen's own
+  block is carried through untouched; a screen that has none gets a warning.
+- The remaining variants (`PKS3`, `PKU3`, `PKVL`) have no palette field and pack
+  the dump as it is, so `--palette` is ignored with a warning.
+
+A 158-byte `.kit` (15 words, pens 1..15) is accepted next to the usual 160-byte
+one, and a `.kit` is also recognised by its size, so a misnamed file still loads.
+When a variant needs a palette and neither the screen nor `--palette` provides a
+usable one, a warning is printed and the packed file keeps an empty palette.
 
 **Compressing the screen, not the header:** every method — the whole PKS family
 included — strips a leading AMSDOS header first, so the packed stream holds

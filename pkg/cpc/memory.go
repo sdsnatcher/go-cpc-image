@@ -43,9 +43,16 @@ const (
 )
 
 // ModePalOffset is the offset of the embedded ModePal block in a standard SCR
-// (mode byte + 16 ink values). Overscan dumps carry it at 0x600 instead;
-// underscan dumps keep it here, exactly like standard ones.
+// (mode byte + 16 ink values). Overscan dumps carry it at
+// OverscanModePalOffset instead; underscan dumps keep it here, exactly like
+// standard ones.
 const ModePalOffset = 0x17D0
+
+// OverscanModePalOffset is where an overscan SCR keeps its ModePal block
+// instead of ModePalOffset. fileio.SaveSCR writes the palette there and
+// applySCRPalette reads it back from there, for the classic and the 33-byte
+// CPC Plus blocks alike.
+const OverscanModePalOffset = 0x600
 
 // ScreenConfig holds the current screen configuration
 type ScreenConfig struct {
@@ -169,16 +176,36 @@ func ColumnMajorToScreen(data []byte, numCol, numLig int) []byte {
 	return out
 }
 
-// ExtractModePal returns the 17-byte ModePal block (mode + 16 inks) from a
-// standard CPC screen dump if present and plausible. Values are ink indices
-// 0..26, or 0xFF for unused pens. Returns nil if the dump is too short or the
-// block is not a plausible palette.
+// ModePalBlockLen returns the length of the ModePal block a screen carries: 33
+// bytes for a CPC Plus screen (the mode byte has bit 7 set and is followed by 16
+// low/high 12-bit colour pairs) and 17 bytes otherwise (mode + 16 classic ink
+// indices).
+func ModePalBlockLen(modeByte byte) int {
+	if modeByte&0x80 != 0 {
+		return 33
+	}
+	return 17
+}
+
+// ExtractModePal returns the ModePal block from a standard CPC screen dump at
+// ModePalOffset: the 17-byte classic block (mode + 16 ink indices, 0xFF for an
+// unused pen) or the 33-byte CPC Plus block when the mode byte has bit 7 set.
+// Returns nil if the dump is too short or a classic block is not a plausible
+// palette (an implausible CPC Plus block cannot be told apart from pixel data,
+// so it is accepted as it is and left to the caller's non-empty check).
 func ExtractModePal(bmp []byte) []byte {
-	if len(bmp) < ModePalOffset+17 {
+	if len(bmp) <= ModePalOffset {
 		return nil
 	}
-	pal := make([]byte, 17)
-	copy(pal, bmp[ModePalOffset:ModePalOffset+17])
+	n := ModePalBlockLen(bmp[ModePalOffset])
+	if len(bmp) < ModePalOffset+n {
+		return nil
+	}
+	pal := make([]byte, n)
+	copy(pal, bmp[ModePalOffset:ModePalOffset+n])
+	if n == 33 {
+		return pal
+	}
 	for _, b := range pal {
 		if b != 0xFF && b > 26 {
 			return nil
@@ -187,19 +214,44 @@ func ExtractModePal(bmp []byte) []byte {
 	return pal
 }
 
-// EmbedModePal writes a 17-byte ModePal block (mode + 16 inks) into a standard
-// CPC screen dump at ModePalOffset. bmp is grown if needed.
+// ExtractClassicModePal returns the 17-byte classic ModePal block, or nil when
+// the screen carries a CPC Plus block instead (bit 7 set) or no plausible
+// palette at all. Use it wherever only classic ink indices are usable: the
+// 17-byte PKS palette field of the "L" variants, and the mode-3 certainty check
+// of the variant detection.
+func ExtractClassicModePal(bmp []byte) []byte {
+	pal := ExtractModePal(bmp)
+	if len(pal) != 17 {
+		return nil
+	}
+	return pal
+}
+
+// EmbedModePal writes a ModePal block into a standard CPC screen dump at
+// ModePalOffset: the 17-byte classic block, or a 33-byte CPC Plus block when pal
+// is that long. bmp is grown if needed.
 func EmbedModePal(bmp []byte, pal []byte) []byte {
-	need := ModePalOffset + 17
+	return EmbedModePalAt(bmp, ModePalOffset, pal)
+}
+
+// EmbedModePalAt writes a ModePal block at an arbitrary offset — an overscan dump
+// keeps its palette at OverscanModePalOffset instead. The block width follows
+// the payload, the same rule ExtractModePal reads it back with. bmp is grown if
+// needed.
+func EmbedModePalAt(bmp []byte, offset int, pal []byte) []byte {
+	n := 17
+	if len(pal) > 17 {
+		n = 33
+	}
+	if len(pal) < n {
+		n = len(pal)
+	}
+	need := offset + n
 	if len(bmp) < need {
 		grown := make([]byte, need)
 		copy(grown, bmp)
 		bmp = grown
 	}
-	n := 17
-	if len(pal) < n {
-		n = len(pal)
-	}
-	copy(bmp[ModePalOffset:], pal[:n])
+	copy(bmp[offset:], pal[:n])
 	return bmp
 }

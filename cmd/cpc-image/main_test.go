@@ -2106,3 +2106,407 @@ func TestCLIConvertPaletteRoundTripPenExact(t *testing.T) {
 		t.Errorf("without --palette the 16-entry PNG must be over budget, got: %q", stderr.String())
 	}
 }
+
+// writeKITWords writes a 160-byte CPC Plus .kit file whose 16 words are given
+// verbatim (little-endian), so a fixture can hold the 0xFFFF "unused pen" marker
+// that a 12-bit value cannot express. It mirrors what fileio.SavePaletteKit
+// writes and what fileio.LoadPaletteKit reads.
+func writeKITWords(t *testing.T, path string, words [16]uint16) string {
+	t.Helper()
+	entete := cpc.CreeEntete(filepath.Base(path), 0x6400, 32, 0)
+	header, err := cpc.AmsdosToByte(entete)
+	if err != nil {
+		t.Fatalf("AmsdosToByte failed: %v", err)
+	}
+	data := make([]byte, 160)
+	copy(data, header)
+	for i, w := range words {
+		binary.LittleEndian.PutUint16(data[128+i*2:], w)
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write KIT failed: %v", err)
+	}
+	return path
+}
+
+// TestCLIPackPlusPaletteKit verifies that a CPC Plus screen is packed with an
+// external .kit palette: the 33-byte block the .kit describes is written into the
+// packed dump — the Plus variants have no palette field in the header — so
+// unpacking restores a dump whose &17D0 block is that block byte for byte, the
+// unused-pen marker included.
+func TestCLIPackPlusPaletteKit(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	// A mode-1 CPC Plus screen carrying its own (different) Plus block.
+	var screenVals [16]int
+	for i := range screenVals {
+		screenVals[i] = 0x0F0 + i
+	}
+	screen := embedPlusModePal(t, mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)),
+		plusModePalBlock(1, screenVals))
+	scrPath := filepath.Join(tempDir, "screen.bin")
+	if err := os.WriteFile(scrPath, screen, 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	// The .kit holds 16 raw words, deliberately including 0xFFFF (unused pen),
+	// which a 12-bit decode cannot represent.
+	words := [16]uint16{
+		0x0000, 0x042F, 0x084D, 0xFFFF, 0x0FCF, 0x0FFF, 0x0123, 0x0ABC,
+		0x0FED, 0x0100, 0x0200, 0x0300, 0xFFFF, 0x0AAA, 0x0BBB, 0x0CCC,
+	}
+	kitPath := writeKITWords(t, filepath.Join(tempDir, "override.kit"), words)
+
+	pksPath := filepath.Join(tempDir, "out.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksp", "--palette", kitPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack --palette failed: %v", err)
+	}
+
+	// The Plus variants keep the 4-byte header: the block rides in the payload.
+	packed := mustRead(t, pksPath)
+	if !cpc.CheckAmsdos(packed) {
+		t.Fatal("packed file has no AMSDOS header")
+	}
+	h, err := compress.ParsePKSHeader(packed[128:])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	if h.DataOffset != 4 {
+		t.Errorf("PKSP payload offset = %d, want 4 (no palette field)", h.DataOffset)
+	}
+
+	backPath := filepath.Join(tempDir, "back.scr")
+	rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", backPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack failed: %v", err)
+	}
+
+	back := mustRead(t, backPath)
+	if len(back) != cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines) {
+		t.Fatalf("restored dump is %d bytes, want %d", len(back), cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	}
+	want := make([]byte, 33)
+	want[0] = 0x8C | 1 // mode 1, read from the screen's own Plus block
+	for i, w := range words {
+		binary.LittleEndian.PutUint16(want[1+i*2:], w)
+	}
+	if got := back[cpc.ModePalOffset : cpc.ModePalOffset+33]; !bytes.Equal(got, want) {
+		t.Errorf("restored Plus block = % x, want % x", got, want)
+	}
+}
+
+// TestCLIPackPlusPaletteWithoutFlag verifies that a CPC Plus screen keeps its own
+// palette block when no --palette is given (silently, since there is nothing to
+// warn about), while a screen whose block was stripped is reported.
+func TestCLIPackPlusPaletteWithoutFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	// --palette is a process-global bound to both commands: clear whatever an
+	// earlier test left behind, and leave a clean state for the next one.
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	var stderr bytes.Buffer
+	rootCmd.SetErr(&stderr)
+	defer rootCmd.SetErr(os.Stderr)
+
+	size := cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+
+	t.Run("screen carries its own Plus block", func(t *testing.T) {
+		vals := [16]int{0x00F, 0x0F0, 0xF00, 0xFFF}
+		screen := embedPlusModePal(t, mkRawSCR(size), plusModePalBlock(1, vals))
+		scrPath := filepath.Join(tempDir, "plus.scr")
+		if err := os.WriteFile(scrPath, screen, 0644); err != nil {
+			t.Fatalf("write screen failed: %v", err)
+		}
+
+		pksPath := filepath.Join(tempDir, "plus.pks")
+		rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksp"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("pack failed: %v", err)
+		}
+		if strings.Contains(stderr.String(), "no usable Plus palette") {
+			t.Errorf("a screen with its own Plus block must not warn, got: %q", stderr.String())
+		}
+
+		backPath := filepath.Join(tempDir, "plus_back.scr")
+		rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", backPath})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("unpack failed: %v", err)
+		}
+		back := mustRead(t, backPath)
+		if got := back[cpc.ModePalOffset : cpc.ModePalOffset+33]; !bytes.Equal(got, screen[cpc.ModePalOffset:cpc.ModePalOffset+33]) {
+			t.Errorf("restored Plus block = % x, want % x", got, screen[cpc.ModePalOffset:cpc.ModePalOffset+33])
+		}
+	})
+
+	t.Run("stripped Plus block", func(t *testing.T) {
+		scrPath := filepath.Join(tempDir, "stripped.scr")
+		if err := os.WriteFile(scrPath, mkRawSCR(size), 0644); err != nil {
+			t.Fatalf("write screen failed: %v", err)
+		}
+
+		stderr.Reset()
+		pksPath := filepath.Join(tempDir, "stripped.pks")
+		rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksp"})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("pack failed: %v", err)
+		}
+		if !strings.Contains(stderr.String(), "no usable Plus palette") {
+			t.Errorf("a stripped Plus block must warn, got: %q", stderr.String())
+		}
+	})
+}
+
+// plusBlockValue decodes one 0x0VBR colour of a 33-byte CPC Plus ModePal block
+// the way applySCRPalette reads it back.
+func plusBlockValue(block []byte, pen int) int {
+	lo := block[1+pen*2]
+	hi := block[2+pen*2]
+	return int(hi&0x0F)<<8 | int(lo&0x0F)<<4 | int((lo>>4)&0x0F)
+}
+
+// TestCLIPackPlusPaletteFromClassicPal verifies a classic .pal can drive a CPC
+// Plus variant: its ink indices are converted to the equivalent 12-bit colours —
+// exact, since all 27 hardware colours are representable — and injected as a Plus
+// block in the packed dump.
+func TestCLIPackPlusPaletteFromClassicPal(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	size := cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+	scrPath := filepath.Join(tempDir, "screen.scr")
+	if err := os.WriteFile(scrPath, mkRawSCR(size), 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	inks := [16]uint16{0, 6, 24, 26, 1, 2, 13, 20, 0, 0, 0, 0, 0, 0, 0, 0}
+	palPath := filepath.Join(tempDir, "lock.pal")
+	if err := fileio.SavePalette(palPath, inks[:], fileio.SCRParams{VirtualMode: 1}); err != nil {
+		t.Fatalf("SavePalette failed: %v", err)
+	}
+
+	pksPath := filepath.Join(tempDir, "out.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksp", "--palette", palPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack --palette failed: %v", err)
+	}
+
+	backPath := filepath.Join(tempDir, "back.scr")
+	rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", backPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack failed: %v", err)
+	}
+
+	block := mustRead(t, backPath)[cpc.ModePalOffset : cpc.ModePalOffset+33]
+	if block[0] != 0x8C|1 {
+		t.Errorf("Plus block mode byte = 0x%02X, want 0x%02X (the .pal's mode)", block[0], 0x8C|1)
+	}
+	for pen, ink := range inks {
+		rgb := cpc.PaletteColor(int(ink), false)
+		want, _ := cpc.NearestPlus(uint8(rgb>>16), uint8(rgb>>8), uint8(rgb))
+		if got := plusBlockValue(block, pen); got != want {
+			t.Errorf("pen %d = 0x%03X, want 0x%03X (from ink %d)", pen, got, want, ink)
+		}
+	}
+}
+
+// TestCLIPackKitToClassicVariant verifies the other cross-conversion: a .kit
+// given to a classic "L" variant is reduced to ink indices in its 17-byte header
+// field, instead of being refused as an unreadable .pal (a .kit is 160 bytes, so
+// the classic loader used to die on a truncated read).
+func TestCLIPackKitToClassicVariant(t *testing.T) {
+	tempDir := t.TempDir()
+	defer resetConvertFlags(t)
+
+	size := cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+	scrPath := filepath.Join(tempDir, "screen.scr")
+	if err := os.WriteFile(scrPath, cpc.EmbedModePal(mkRawSCR(size), []byte{1, 0, 6, 24, 26}), 0644); err != nil {
+		t.Fatalf("write screen failed: %v", err)
+	}
+
+	// A .kit holding the exact hardware colours white, red, green and black.
+	vals := [16]int{0xFFF, 0x00F, 0xF00, 0x000}
+	var words [16]uint16
+	for i, v := range vals {
+		words[i] = uint16(((v>>8)&0x0F)<<8 | (v&0x0F)<<4 | (v>>4)&0x0F)
+	}
+	kitPath := writeKITWords(t, filepath.Join(tempDir, "plus.kit"), words)
+
+	pksPath := filepath.Join(tempDir, "out.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksl", "--palette", kitPath})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack --palette with a .kit failed: %v", err)
+	}
+
+	header, err := compress.ParsePKSHeader(mustRead(t, pksPath)[128:])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	if header.Variant != compress.PKSL {
+		t.Fatalf("variant = %v, want PKSL", header.Variant)
+	}
+	if header.Palette[0] != 1 {
+		t.Errorf("header palette mode byte = %d, want 1 (the screen's mode)", header.Palette[0])
+	}
+	for pen, v := range vals {
+		rgb := cpc.PaletteColor(v, true)
+		want, exact := cpc.NearestInk(uint8(rgb>>16), uint8(rgb>>8), uint8(rgb))
+		if !exact {
+			t.Fatalf("test fixture colour 0x%03X is not a hardware ink", v)
+		}
+		if got := int(header.Palette[1+pen]); got != want {
+			t.Errorf("pen %d ink = %d, want %d (from 0x%03X)", pen, got, want, v)
+		}
+	}
+}
+
+// TestCLIPlusKitRealSamples exercises the real CPC Plus corpus, where each
+// raw+kit directory pairs a screen with the .kit holding its palette. Packing
+// with --palette must place the .kit's 33-byte block inside the packed dump —
+// the Plus variants have no palette field — so unpacking restores exactly that
+// block, the 0xFFFF "unused pen" markers included. A sample that still carries
+// its own block must round-trip it unchanged, the block the .kit describes must
+// be what the screen itself holds, and the .kit reader and writer must be
+// inverses of one another.
+func TestCLIPlusKitRealSamples(t *testing.T) {
+	root := os.Getenv(corpusSamplesEnv)
+	if root == "" {
+		t.Skipf("set %s to run the corpus-driven tests", corpusSamplesEnv)
+	}
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	var pairs []string
+	for _, modeDir := range []string{"mode0+", "mode1+", "mode2+"} {
+		found, _ := filepath.Glob(filepath.Join(root, modeDir, "standard_*", "raw+kit", "*.KIT"))
+		pairs = append(pairs, found...)
+	}
+	if len(pairs) == 0 {
+		t.Skipf("no CPC Plus .kit pairs under %s", root)
+	}
+
+	tempDir := t.TempDir()
+	for _, kit := range pairs {
+		kit := kit
+		name := strings.TrimSuffix(filepath.Base(kit), filepath.Ext(kit))
+		t.Run(filepath.Base(filepath.Dir(filepath.Dir(kit)))+"/"+name, func(t *testing.T) {
+			kitBytes := mustRead(t, kit)
+			payload := kitBytes[128:]
+			if len(payload) != 32 {
+				t.Fatalf(".kit payload is %d bytes, want 32", len(payload))
+			}
+
+			// 1) The .kit reader and writer are inverses: every colour of the
+			// corpus .kit survives a save/load cycle (the writer used to swap
+			// the wrong nibbles, so 0x042F came back as 0x1300). The 0xFFFF
+			// "unused pen" word is the single exception: the loader reads it as
+			// the 12-bit colour 0xFFF, so a re-saved file marks that pen white.
+			var loaded [16]uint16
+			if err := fileio.LoadPaletteKit(kit, loaded[:]); err != nil {
+				t.Fatalf("LoadPaletteKit failed: %v", err)
+			}
+			outKIT := filepath.Join(tempDir, name+".kit")
+			if err := fileio.SavePaletteKit(outKIT, loaded[:]); err != nil {
+				t.Fatalf("SavePaletteKit failed: %v", err)
+			}
+			var reloaded [16]uint16
+			if err := fileio.LoadPaletteKit(outKIT, reloaded[:]); err != nil {
+				t.Fatalf("LoadPaletteKit of the re-saved file failed: %v", err)
+			}
+			if reloaded != loaded {
+				t.Errorf("KIT round trip = %v, want %v", reloaded, loaded)
+			}
+			got := mustRead(t, outKIT)[128:]
+			for i := 0; i < 16; i++ {
+				wantWord := binary.LittleEndian.Uint16(payload[i*2:])
+				if wantWord == 0xFFFF {
+					continue // unused pen, not a colour, see above
+				}
+				if gotWord := binary.LittleEndian.Uint16(got[i*2:]); gotWord != wantWord {
+					t.Errorf("pen %d word = 0x%04X, want 0x%04X", i, gotWord, wantWord)
+				}
+			}
+
+			// 2) A screen carrying its own Plus block describes exactly the
+			// palette the .kit holds: 0x8C|mode followed by the payload.
+			rawScr := filepath.Join(filepath.Dir(filepath.Dir(kit)), "raw", name+".SCR")
+			rawBlock := []byte(nil)
+			if _, err := os.Stat(rawScr); err == nil {
+				rawBytes := mustRead(t, rawScr)
+				rawPayload := rawBytes[128:]
+				block := cpc.ExtractModePal(rawPayload)
+				if len(block) != 33 {
+					t.Fatalf("ExtractModePal(%s) = %d bytes, want the 33-byte Plus block", rawScr, len(block))
+				}
+				rawBlock = block
+				if block[0]&0x80 == 0 {
+					t.Errorf("Plus block mode byte = 0x%02X, want bit 7 set", block[0])
+				}
+				if !bytes.Equal(block[1:], payload) {
+					t.Errorf("screen block payload = % x, want the .kit payload % x", block[1:], payload)
+				}
+
+				// ...and packing that screen with --palette restores the very
+				// same block, so nothing about it is lost on the way.
+				pksPath := filepath.Join(tempDir, name+"_raw.pks")
+				backPath := filepath.Join(tempDir, name+"_raw.scr")
+				rootCmd.SetArgs([]string{"pack", "-i", rawScr, "-o", pksPath, "--method", "pksp", "--palette", kit})
+				if err := rootCmd.Execute(); err != nil {
+					t.Fatalf("pack %s failed: %v", rawScr, err)
+				}
+				rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", backPath})
+				if err := rootCmd.Execute(); err != nil {
+					t.Fatalf("unpack failed: %v", err)
+				}
+				back := mustRead(t, backPath)
+				if got := back[cpc.ModePalOffset : cpc.ModePalOffset+33]; !bytes.Equal(got, rawBlock) {
+					t.Errorf("restored block = % x, want the screen's own % x", got, rawBlock)
+				}
+			}
+
+			// 3) The raw+kit screen has a stripped block, so the mode is unknown
+			// and defaults to 0: the .kit payload is still placed verbatim.
+			scrPath := filepath.Join(filepath.Dir(kit), name+".SCR")
+			if _, err := os.Stat(scrPath); err != nil {
+				t.Skipf("screen not available: %s", scrPath)
+			}
+			pksPath := filepath.Join(tempDir, name+".pks")
+			backPath := filepath.Join(tempDir, name+".scr")
+			rootCmd.SetArgs([]string{"pack", "-i", scrPath, "-o", pksPath, "--method", "pksp", "--palette", kit})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack %s failed: %v", scrPath, err)
+			}
+
+			// The packed file keeps the 4-byte header of every Plus variant.
+			packed := mustRead(t, pksPath)
+			h, err := compress.ParsePKSHeader(packed[128:])
+			if err != nil {
+				t.Fatalf("ParsePKSHeader failed: %v", err)
+			}
+			if !h.CpcPlus {
+				t.Errorf("packed header does not report CPC Plus (variant %v)", h.Variant)
+			}
+			if h.DataOffset != 4 {
+				t.Errorf("%v payload offset = %d, want 4 (no palette field)", h.Variant, h.DataOffset)
+			}
+
+			rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", backPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("unpack failed: %v", err)
+			}
+
+			want := make([]byte, 33)
+			want[0] = 0x8C // stripped block: the mode cannot be recovered, so 0
+			copy(want[1:], payload)
+			back := mustRead(t, backPath)
+			if len(back) != cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines) {
+				t.Fatalf("restored dump is %d bytes, want %d", len(back), cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+			}
+			if got := back[cpc.ModePalOffset : cpc.ModePalOffset+33]; !bytes.Equal(got, want) {
+				t.Errorf("restored block = % x, want % x", got, want)
+			}
+		})
+	}
+}

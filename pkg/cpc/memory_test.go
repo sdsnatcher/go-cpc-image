@@ -336,3 +336,107 @@ func TestColumnMajorGeometryRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// TestModePalBlockLen verifies the block width follows the mode byte: 33 bytes
+// for a CPC Plus screen (bit 7 set, 16 low/high colour pairs) and 17 otherwise.
+func TestModePalBlockLen(t *testing.T) {
+	tests := []struct {
+		modeByte byte
+		want     int
+	}{
+		{0x00, 17}, {0x01, 17}, {0x02, 17}, {0x03, 17}, {0x04, 17},
+		{0x80, 33}, {0x8C, 33}, {0x8D, 33}, {0x8E, 33}, {0x8F, 33},
+	}
+	for _, tt := range tests {
+		if got := ModePalBlockLen(tt.modeByte); got != tt.want {
+			t.Errorf("ModePalBlockLen(0x%02X) = %d, want %d", tt.modeByte, got, tt.want)
+		}
+	}
+}
+
+// plusBlock builds a 33-byte CPC Plus ModePal block from 12-bit 0x0VBR values,
+// the way fileio.SaveSCR writes it: mode byte with bit 7 set, then 16 low/high
+// pairs.
+func plusBlock(mode int, vals [16]int) []byte {
+	block := make([]byte, 33)
+	block[0] = byte(mode | 0x8C)
+	for i, v := range vals {
+		block[1+i*2] = byte(((v >> 4) & 0x0F) | ((v << 4) & 0xF0))
+		block[2+i*2] = byte((v >> 8) & 0x0F)
+	}
+	return block
+}
+
+// palDump returns a standard screen dump with block embedded at ModePalOffset.
+func palDump(block []byte) []byte {
+	return EmbedModePal(make([]byte, BitmapSize(StandardCols, StandardLines)), block)
+}
+
+// TestExtractModePalClassicAndPlus verifies that both block widths are read back
+// and that the classic-only reader rejects a CPC Plus block, which the mode-3
+// certainty check and the 17-byte PKS palette field rely on.
+func TestExtractModePalClassicAndPlus(t *testing.T) {
+	classic := []byte{1, 0, 6, 24, 26, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+	var vals [16]int
+	for i := range vals {
+		vals[i] = (i << 8) | ((15 - i) << 4) | i
+	}
+	plus := plusBlock(1, vals)
+
+	if got := ExtractModePal(palDump(classic)); !bytes.Equal(got, classic) {
+		t.Errorf("classic ExtractModePal = % x, want % x", got, classic)
+	}
+	if got := ExtractModePal(palDump(plus)); !bytes.Equal(got, plus) {
+		t.Errorf("Plus ExtractModePal = % x, want % x", got, plus)
+	}
+	if got := ExtractClassicModePal(palDump(classic)); !bytes.Equal(got, classic) {
+		t.Errorf("classic ExtractClassicModePal = % x, want % x", got, classic)
+	}
+	if got := ExtractClassicModePal(palDump(plus)); got != nil {
+		t.Errorf("ExtractClassicModePal of a Plus block = % x, want nil", got)
+	}
+
+	// A classic block with an out-of-range ink is not a palette.
+	bad := implausibleClassicBlock()
+	if got := ExtractModePal(palDump(bad)); got != nil {
+		t.Errorf("implausible classic block = % x, want nil", got)
+	}
+
+	// Too short to hold a block at all.
+	if got := ExtractModePal(make([]byte, ModePalOffset)); got != nil {
+		t.Errorf("short dump = % x, want nil", got)
+	}
+}
+
+// implausibleClassicBlock returns a 17-byte block holding an ink index above 26,
+// i.e. a plausible-looking mode byte followed by a value no real palette uses.
+func implausibleClassicBlock() []byte {
+	return []byte{1, 0, 6, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+}
+
+// TestEmbedModePalAt verifies the offset-aware writer: it grows a short dump, and
+// the block width follows the payload (a 33-byte slice writes the Plus block).
+func TestEmbedModePalAt(t *testing.T) {
+	// Growing: an empty dump gets extended to hold the block.
+	classic := []byte{1, 0, 6}
+	got := EmbedModePalAt(nil, OverscanModePalOffset, classic)
+	if len(got) != OverscanModePalOffset+3 {
+		t.Fatalf("grown dump length = %d, want %d", len(got), OverscanModePalOffset+3)
+	}
+	if !bytes.Equal(got[OverscanModePalOffset:], classic) {
+		t.Errorf("overscan block = % x, want % x", got[OverscanModePalOffset:], classic)
+	}
+
+	// A 33-byte payload writes a 33-byte block, leaving the dump grown to fit.
+	var vals [16]int
+	vals[0] = 0x4F2
+	block := plusBlock(1, vals)
+	dump := EmbedModePalAt(make([]byte, BitmapSize(StandardCols, StandardLines)), ModePalOffset, block)
+	if !bytes.Equal(dump[ModePalOffset:ModePalOffset+33], block) {
+		t.Errorf("Plus block = % x, want % x", dump[ModePalOffset:ModePalOffset+33], block)
+	}
+	// The unrelated bytes right after the block are untouched.
+	if dump[ModePalOffset+33] != 0 {
+		t.Errorf("byte after the block = 0x%02X, want 0", dump[ModePalOffset+33])
+	}
+}
