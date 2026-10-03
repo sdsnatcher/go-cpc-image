@@ -2510,3 +2510,63 @@ func TestCLIPlusKitRealSamples(t *testing.T) {
 		})
 	}
 }
+
+// TestCLIUnpackRejectsRenderedOutputFormats verifies that `unpack` refuses to
+// write its decompressed bytes into a file whose name announces a format it does
+// not produce. A restored PKS payload is raw screen data, so `unpack
+// -o screen.png` used to emit 16336 raw bytes, report success with exit 0 and
+// leave behind a file no viewer can open — the mistake only surfacing later, in
+// whatever read it. Those extensions now fail with a non-zero exit and write
+// nothing, while the raw outputs (.scr, .bin) keep working unchanged.
+func TestCLIUnpackRejectsRenderedOutputFormats(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// A real PKSL payload, produced by the pack command itself.
+	srcSCR := filepath.Join(tempDir, "src.scr")
+	if err := writeSCR(srcSCR, cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)); err != nil {
+		t.Fatalf("writeSCR failed: %v", err)
+	}
+	pksPath := filepath.Join(tempDir, "screen.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", srcSCR, "-o", pksPath, "--method", "pksl"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack failed: %v", err)
+	}
+
+	// Case is irrelevant, so .PNG must be rejected too.
+	for _, ext := range []string{".png", ".PNG", ".jpg", ".jpeg", ".gif", ".bmp", ".asm", ".dsk"} {
+		t.Run(ext, func(t *testing.T) {
+			outPath := filepath.Join(tempDir, "screen"+ext)
+			rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", outPath})
+			err := rootCmd.Execute()
+			if err == nil {
+				t.Fatalf("unpack into %s must fail", ext)
+			}
+			if !strings.Contains(err.Error(), "not supported") {
+				t.Errorf("error should report an unsupported output format, got: %v", err)
+			}
+			if _, serr := os.Stat(outPath); serr == nil {
+				t.Errorf("unpack must not create %s", outPath)
+			}
+		})
+	}
+
+	// The outputs `unpack` does produce are unaffected, and a restored screen is
+	// exactly what the other commands expect to read.
+	scrOut := filepath.Join(tempDir, "back.scr")
+	rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", scrOut})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack into .scr failed: %v", err)
+	}
+	if got := mustRead(t, scrOut); len(got) != cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines) {
+		t.Errorf("restored .scr is %d bytes, want %d", len(got), cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	}
+
+	binOut := filepath.Join(tempDir, "back.bin")
+	rootCmd.SetArgs([]string{"unpack", "-i", pksPath, "-o", binOut})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("unpack into .bin failed: %v", err)
+	}
+	if !bytes.Equal(mustRead(t, scrOut), mustRead(t, binOut)) {
+		t.Error("the .scr and .bin outputs must hold the same bytes")
+	}
+}

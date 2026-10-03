@@ -70,6 +70,10 @@
 - **Rejects raw (uncompressed) SCR input** in auto-detect with a non-zero exit
 - **Rejects unrecognized data**: LZW output that is not a recognized CPC screen
   size (16336 / 31936 / 16000 bytes) is treated as corrupt
+- **Rejects output names it cannot honour**: `.png`, `.jpg`, `.jpeg`, `.gif`,
+  `.bmp`, `.asm` and `.dsk` outputs are refused (non-zero exit, nothing written),
+  since `unpack` only writes the decompressed bytes — a `.png` full of raw screen
+  data would be silently misnamed; `convert` renders a restored screen
 
 #### Info Command ✅
 - **File type detection:** .scr, .dsk, .pal

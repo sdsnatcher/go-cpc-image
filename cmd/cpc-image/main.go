@@ -741,6 +741,19 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("input file is empty")
 	}
 
+	// `unpack` writes the decompressed bytes as they are: a CPC screen dump for
+	// the PKS family, the plain stream for LZW and OCP. It never renders an image
+	// or assembles a file, so an output name that announces one of those formats
+	// would be silently misnamed — a `.png` holding 16336 raw bytes opens in no
+	// viewer, and the mistake only shows up later, in whatever reads the file, or
+	// never. Reject those extensions up-front and point at `convert`, which does
+	// render.
+	switch ext := strings.ToLower(filepath.Ext(outputFile)); ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".asm", ".dsk":
+		return fmt.Errorf("unpack: output format %s is not supported: unpack only writes the decompressed bytes (render a restored screen with convert, e.g. `convert -i out.scr -o out.png`): %s",
+			ext, outputFile)
+	}
+
 	compressor := compress.NewCompressor()
 	outputBuffer := make([]byte, 0x20000) // 128KB max buffer for decompressed CPC data
 

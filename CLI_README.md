@@ -222,6 +222,15 @@ succeed with a bogus output. To prevent emitting a corrupt file, `unpack` only
 accepts LZW output whose size matches a recognized CPC screen payload
 (16336 / 31936 / 16000 bytes); anything else fails with a non-zero exit.
 
+**Rejecting output names it cannot honour:** `unpack` writes the decompressed
+bytes as they are — a screen dump for the PKS family, the plain stream for LZW and
+OCP — so it never renders an image or assembles a file. An output name ending in
+`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.asm` or `.dsk` is therefore refused
+with a non-zero exit instead of being filled with raw bytes: a `.png` holding
+16336 raw bytes opens in no viewer, and the mistake would only surface later, in
+whatever read it. Render a restored screen with
+`convert -i out.scr -o out.png`.
+
 ### info - Display file information
 
 Show metadata about CPC files including AMSDOS headers, palette information, and file dimensions.
