@@ -3,6 +3,9 @@
 ## ✅ Completed
 
 ### Core CLI Structure
+- **Version reporting:** `internal/version` holds the single version string shared
+  by the CLI and the GUI; `--version` prints `convimgcpc version 1.2.1`, and the
+  verbose banner and the GUI title label read the same constant
 - **Cobra-based CLI framework** with proper command structure
 - **Five main commands implemented:**
   - `convert` - Image conversion with full parameter support

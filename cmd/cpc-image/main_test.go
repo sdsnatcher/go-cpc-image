@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ikari-pl/go-cpc-image/internal/version"
 	"github.com/ikari-pl/go-cpc-image/pkg/bitmap"
 	"github.com/ikari-pl/go-cpc-image/pkg/compress"
 	"github.com/ikari-pl/go-cpc-image/pkg/convert"
@@ -2624,5 +2625,36 @@ func TestCLIUnpackRejectsRenderedOutputFormats(t *testing.T) {
 	}
 	if !bytes.Equal(mustRead(t, scrOut), mustRead(t, binOut)) {
 		t.Error("the .scr and .bin outputs must hold the same bytes")
+	}
+}
+
+// TestCLIVersionFlag verifies that --version reports the release being built.
+// The flag went missing during the import from the 1.2.0-pks tree, and the
+// string it reports must name this release (1.2.1), not the unofficial -pks
+// build it replaced; the verbose banner carries the same string.
+func TestCLIVersionFlag(t *testing.T) {
+	var out bytes.Buffer
+	rootCmd.SetOut(&out)
+	defer rootCmd.SetOut(os.Stdout)
+
+	rootCmd.SetArgs([]string{"--version"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("--version failed: %v", err)
+	}
+
+	want := "convimgcpc version " + version.Version
+	if got := strings.TrimSpace(out.String()); got != want {
+		t.Errorf("--version printed %q, want %q", got, want)
+	}
+	if version.Version != "1.2.1" {
+		t.Errorf("version = %q, want the released 1.2.1", version.Version)
+	}
+	// -v stays the verbose shorthand: cobra drops the -v alias for --version
+	// when the shorthand is taken, and a silent `-v` (no banner) would mean the
+	// alias had been hijacked.
+	if f := rootCmd.Flags().Lookup("version"); f == nil {
+		t.Fatal("--version flag is not registered")
+	} else if f.Shorthand != "" {
+		t.Errorf("--version shorthand = %q, want none (-v is --verbose)", f.Shorthand)
 	}
 }

@@ -12,6 +12,11 @@ go build ./cmd/cpc-image/
 
 This creates the `cpc-image` executable in the project root.
 
+## Global flags
+
+- `--version` - print the release version (`convimgcpc version 1.2.1`) and exit
+- `-v, --verbose` - print a banner naming the version and the details of every step
+
 ## Commands
 
 ### convert - Convert images to CPC formats

@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ikari-pl/go-cpc-image/internal/version"
 	"github.com/ikari-pl/go-cpc-image/pkg/bitmap"
 	"github.com/ikari-pl/go-cpc-image/pkg/compress"
 	"github.com/ikari-pl/go-cpc-image/pkg/convert"
@@ -47,8 +48,9 @@ var (
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "convimgcpc",
-	Short: "Amstrad CPC image conversion utility",
+	Use:     "convimgcpc",
+	Short:   "Amstrad CPC image conversion utility",
+	Version: version.Version,
 	Long: `ConvImgCpc is a tool for converting images to Amstrad CPC formats.
 It supports various CPC modes, dithering algorithms, compression methods,
 and can generate .scr, .asm, .dsk, and .png files.
@@ -59,7 +61,7 @@ Examples:
   convimgcpc info screen.scr`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		if verbose {
-			fmt.Println("ConvImgCpc Go version - verbose output enabled")
+			fmt.Printf("ConvImgCpc Go version %s - verbose output enabled\n", version.Version)
 		}
 	},
 }
@@ -165,6 +167,10 @@ func init() {
 	// clean one-line error output.
 	rootCmd.SilenceUsage = true
 	rootCmd.SilenceErrors = true
+
+	// Cobra prints "name version X.Y.Z" for --version; keep the historical
+	// spelling of this CLI (which is convimgcpc, not cpc-image) explicit.
+	rootCmd.SetVersionTemplate("convimgcpc version {{.Version}}\n")
 
 	// Global flags
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
