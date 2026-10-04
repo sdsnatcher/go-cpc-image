@@ -1505,22 +1505,84 @@ func nearestPalIndex(palRGB []int, rgb int) uint8 {
 	return uint8(best)
 }
 
-// scrGeometry returns the CPC screen geometry (bytes per line, lines) of a raw
-// SCR payload. Underscan dumps — BitmapSize(64, 192) bytes — use the underscan
-// layout instead of the standard 80x200 one, whose pixel addresses differ.
-// Overscan dumps are not special-cased yet: faithful overscan rendering is a
-// separate change, which can extend this helper with the AMSDOS load address.
-func scrGeometry(payloadLen int) (numCol, numLig int) {
-	if payloadLen == cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines) {
-		return cpc.UnderscanCols, cpc.UnderscanLines
+// scrGeometry returns the CPC screen geometry (columns, lines) of a raw SCR
+// payload. A screen dump comes in three layouts: the standard 80x200 one
+// (16336 bytes), the underscan 64x192 one (15872 bytes, which addresses its
+// pixels differently) and the overscan 96x272 one (31936 bytes, whose lines
+// past 255 live in the second half of the payload). A payload of none of those
+// sizes is not a screen that can be rendered faithfully — reading it as 80x200
+// anyway is exactly how an overscan dump used to lose its lower half — so it is
+// reported as unknown and the caller rejects it.
+func scrGeometry(payloadLen int) (numCol, numLig int, known bool) {
+	switch payloadLen {
+	case cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines):
+		return cpc.StandardCols, cpc.StandardLines, true
+	case cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines):
+		return cpc.UnderscanCols, cpc.UnderscanLines, true
+	case cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines):
+		return cpc.OverscanCols, cpc.OverscanLines, true
 	}
-	return cpc.StandardCols, cpc.StandardLines
+	return 0, 0, false
+}
+
+// scrOutputSize returns the size the PNG of a screen is emitted at. The renderer
+// draws on a display canvas of NumCol*8 by NumLig*2 — a fixed 640-dot timeline
+// in which a mode-0 pixel spans 4 canvas dots, a mode-1 pixel 2 and a mode-2
+// pixel 1 — so the canvas magnifies the picture and cannot be written out as it
+// is. Halving both axes for modes 0 and 1 emits the screen at its own
+// resolution (320x200 standard, 256x192 underscan, 384x272 overscan) while
+// preserving the canvas's pixel aspect; mode 2, whose pixels are one canvas dot
+// wide already, keeps the whole canvas (640x400 / 512x384 / 768x544) so that
+// halving does not throw away half of its horizontal detail.
+func scrOutputSize(numCol, numLig, mode int) (width, height int) {
+	div := 2
+	if mode == 2 {
+		div = 1
+	}
+	return numCol * 8 / div, numLig * 2 / div
+}
+
+// scaleImage resamples a rendered frame to dstW x dstH by nearest neighbour:
+// whole pixels are replicated or dropped, never blended, so a pen colour comes
+// through exactly and an integer factor stays exact. It is the output
+// counterpart of resizeToCanvas — the same integer mapping, applied to the
+// rendered CPC canvas instead of to the source picture — and it is generic so
+// that a screen rendered at another resolution can be brought to the same
+// emitted grid.
+func scaleImage(src *image.RGBA, dstW, dstH int) *image.RGBA {
+	if src == nil || dstW <= 0 || dstH <= 0 {
+		return src
+	}
+	b := src.Bounds()
+	if b.Dx() == dstW && b.Dy() == dstH {
+		return src
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	for y := 0; y < dstH; y++ {
+		sy := b.Min.Y + y*b.Dy()/dstH
+		if sy >= b.Max.Y {
+			sy = b.Max.Y - 1
+		}
+		row := dst.PixOffset(0, y)
+		for x := 0; x < dstW; x++ {
+			sx := b.Min.X + x*b.Dx()/dstW
+			if sx >= b.Max.X {
+				sx = b.Max.X - 1
+			}
+			si := src.PixOffset(sx, sy)
+			copy(dst.Pix[row+x*4:], src.Pix[si:si+4])
+		}
+	}
+	return dst
 }
 
 // convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
 // This is the reverse direction of the normal convert command: input is .SCR,
-// output is .PNG. warn receives the warnings and, with verbose, the note that an
-// external --palette file replaced the SCR's own ModePal.
+// output is .PNG, emitted at the screen's own resolution (see scrOutputSize) and
+// refusing a payload that is not a screen dump (see scrGeometry). warn receives
+// the warnings and, with verbose, the note that an external --palette file
+// replaced the SCR's own ModePal.
 func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool) error {
 	data, err := os.ReadFile(inputFile)
 	if err != nil {
@@ -1559,28 +1621,31 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 		}
 	}
 
-	// Underscan dumps are 15872 bytes and their pixel addresses differ from the
-	// standard 80x200 layout, so read the geometry before the padding below.
-	numCol, numLig := scrGeometry(len(payload))
-
-	// LoadSCR needs at least 16384 bytes; a standard SCR payload is 16336.
-	if len(payload) < 16384 {
-		pad := make([]byte, 16384)
-		copy(pad, payload)
-		payload = pad
+	// The geometry follows from the payload size: a 15872-byte underscan dump
+	// addresses its pixels differently from the standard 80x200 one, and a
+	// 31936-byte overscan dump does not fit that layout at all. Any other size
+	// is not a screen that can be rendered faithfully, so it is rejected instead
+	// of being read as a standard one.
+	numCol, numLig, known := scrGeometry(len(payload))
+	if !known {
+		return fmt.Errorf("unrecognized SCR payload size: %d bytes (a screen dump is %d bytes for 80x200, %d for 64x192 underscan or %d for 96x272 overscan)",
+			len(payload),
+			cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines),
+			cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines),
+			cpc.BitmapSize(cpc.OverscanCols, cpc.OverscanLines))
 	}
 
-	screenData, _, lerr := fileio.LoadSCR(payload)
-	if lerr != nil {
-		return fmt.Errorf("failed to load SCR data: %w", lerr)
-	}
-
+	// The payload already is a CPC screen dump, so it goes straight into the
+	// screen buffer: fileio.LoadSCR would copy only its first 16 KB and hand
+	// back a hardcoded palette, which is what truncated overscan dumps in half.
 	bmp := render.NewBitmapCpcWithParams(numCol, numLig, false)
-	copy(bmp.ScreenData[:], screenData)
+	copy(bmp.ScreenData[:], payload)
 
-	// ModePal offset: standard SCR layout places the mode + palette at
-	// ModePalOffset; overscan uses a different location (0x600). The overscan
-	// signal is derived from the AMSDOS load address or the file size.
+	// ModePal offset: standard and underscan dumps keep the mode byte and the
+	// palette at ModePalOffset, overscan dumps carry them at 0x600 instead — the
+	// slot fileio.SaveSCR writes them to. The geometry identifies an overscan
+	// dump, and the AMSDOS load address (&0200) corroborates it when the header
+	// validates.
 	modeOffset := cpc.ModePalOffset
 	addr := uint16(0)
 	if len(data) >= 128 && cpc.CheckAmsdos(data) {
@@ -1588,15 +1653,15 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 			addr = ent.Address
 		}
 	}
-	if (addr == 0x0200) || (addr == 0 && len(data) >= 0x4000) {
-		modeOffset = 0x600
+	if numCol == cpc.OverscanCols || addr == 0x0200 {
+		modeOffset = cpc.OverscanModePalOffset
 	}
 
-	// Use the palette embedded in the SCR (ModePal block) instead of the
-	// fixed default palette returned by LoadSCR. When there is no usable
-	// block the default palette is a guess, not the screen's real one: say so
-	// instead of silently rendering a solid block.
-	applied := applySCRPalette(bmp, screenData, modeOffset)
+	// Use the palette embedded in the SCR (its ModePal block) rather than the
+	// renderer's default. When there is no usable block the default palette is a
+	// guess, not the screen's real one: say so instead of silently rendering a
+	// solid block.
+	applied := applySCRPalette(bmp, bmp.ScreenData[:], modeOffset)
 
 	// An explicit --palette overrides the ModePal carried by the screen (rules
 	// 1+2): it drives both the render and the output PLTE. Replacing the palette
@@ -1625,6 +1690,12 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 		return fmt.Errorf("failed to render SCR screen data")
 	}
 
+	// Output stage: the canvas is written out at the screen's own resolution
+	// instead of the renderer's magnified one. The scaler drops whole pixels, so
+	// the pens survive exactly.
+	outW, outH := scrOutputSize(numCol, numLig, bmp.VirtualMode)
+	img = scaleImage(img, outW, outH)
+
 	file, err := os.Create(outputFile)
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %w", err)
@@ -1643,7 +1714,7 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 	} else {
 		fmt.Printf("  Output: %s\n", outputFile)
 	}
-	fmt.Printf("  Mode: %d (%dx%d pixels)\n", bmp.VirtualMode, bmp.NumCol*8, bmp.NumLig*2)
+	fmt.Printf("  Mode: %d (%dx%d pixels)\n", bmp.VirtualMode, outW, outH)
 
 	return nil
 }

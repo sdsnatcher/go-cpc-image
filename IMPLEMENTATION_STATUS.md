@@ -23,6 +23,13 @@
 - **Input formats:** PNG, JPEG, BMP, GIF support
 - **SCR input:** a `.scr` file is a CPC screen, not a bitmap: it is rendered back
   to an **indexed-color PNG** whose PLTE follows the screen's ModePal pen order.
+  The geometry comes from the payload size — 16336 bytes standard 80x200, 15872
+  underscan 64x192, 31936 overscan 96x272 — and the whole payload is rendered, so
+  an overscan dump keeps its lines past 255 instead of losing them to a 16 KB
+  read; a payload of no screen size is refused (non-zero exit, nothing written).
+  The PNG is emitted at the screen's own resolution: 320x200 / 256x192 / 384x272
+  for modes 0 and 1 and 640x400 / 512x384 / 768x544 for mode 2, so the renderer's
+  640-dot canvas is halved instead of written out as it is.
   A **PKS-compressed** screen (`*.pks`, or a packed sample under
   `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
   the packed and raw forms of a screen give identical PNGs; a variant the PKS

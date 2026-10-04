@@ -31,6 +31,18 @@ screen is unpacked first — the PKS family is what `pack` writes — so
 `samples/**/pk_compressed/*.SCR` can be rendered directly; only a variant the
 engine does not implement is refused.
 
+The geometry comes from the payload size and the whole payload is rendered: a
+16336-byte dump is a standard 80x200 screen, a 15872-byte one an underscan
+64x192 screen, and a 31936-byte one an **overscan** 96x272 screen (mode byte and
+palette at `&600`) whose lines past 255 live in the second half of the file. A
+payload of none of those sizes is refused with a **non-zero exit** and nothing
+written, rather than guessed as a standard screen.
+
+The PNG is emitted at the screen's own resolution, not at the renderer's 640-dot
+canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 /
+768x544 for mode 2. Scaling is nearest neighbour, so no pen colour is blended or
+invented, and the canvas's pixel aspect is preserved.
+
 **Basic Usage:**
 ```bash
 cpc-image convert -i photo.png -o screen.scr -m 1
@@ -300,8 +312,13 @@ cpc-image palette --convert mypalette.pal mypalette.kit
 **Mode 1:** 320x200 pixels, 4 colors from palette, 4 pixels per byte (most common)
 **Mode 2:** 640x200 pixels, 2 colors from palette, 8 pixels per byte
 
-**Overscan:** Increases resolution to 96x272 columns/lines (768x544 pixels in Mode 1)
+**Overscan:** Raises the resolution to 96x272 columns/lines (a 31936-byte dump)
+**Underscan:** Lowers it to 64x192 columns/lines (a 15872-byte dump)
 **CPC Plus:** Uses 4096 color palette instead of standard 27-color palette
+
+SCR→PNG emits the screen's own resolution rather than the renderer's 640-dot
+canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1, 640x400 / 512x384 /
+768x544 for mode 2.
 
 ## Examples by Use Case
 

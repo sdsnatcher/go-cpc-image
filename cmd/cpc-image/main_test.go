@@ -46,6 +46,45 @@ func writeSCR(path string, size int) error {
 	return err
 }
 
+// syntheticSCR builds a CPC screen dump of the given geometry and mode: every
+// pixel byte carries a pattern and a visible ModePal block sits in the slot the
+// geometry uses (&17D0, or &600 for overscan). The addressing follows the
+// geometry itself, so an overscan dump spreads its lines past 255 over the
+// second half of the payload.
+func syntheticSCR(numCol, numLig, mode int) []byte {
+	raw := make([]byte, cpc.BitmapSize(numCol, numLig))
+	for x := 0; x < numCol; x++ {
+		for y := 0; y < numLig; y++ {
+			adr := x + cpc.CpcAddress(y<<1, numCol, numLig)
+			if adr < len(raw) {
+				raw[adr] = byte((x*13 + y*7) & 0xFF)
+			}
+		}
+	}
+
+	offset := cpc.ModePalOffset
+	if numCol == cpc.OverscanCols {
+		offset = cpc.OverscanModePalOffset
+	}
+	pal := make([]byte, 17)
+	pal[0] = byte(mode)
+	for i := 1; i < 17; i++ {
+		pal[i] = byte(i) // 16 distinct inks: every pen the mode uses is visible
+	}
+	return cpc.EmbedModePalAt(raw, offset, pal)
+}
+
+// amsdosWrap prepends an AMSDOS header loading at addr, the way a saved screen
+// carries one.
+func amsdosWrap(t *testing.T, payload []byte, addr uint16) []byte {
+	t.Helper()
+	hdr, err := cpc.AmsdosToByte(cpc.CreeEntete("screen.scr", addr, uint16(len(payload)), 0xC7D0))
+	if err != nil {
+		t.Fatalf("AmsdosToByte failed: %v", err)
+	}
+	return append(hdr, payload...)
+}
+
 // TestCLIPackRejectsCompressedInput verifies the
 // `pack` command refuses to re-compress already-compressed data:
 //   - content signatures — PKS payload ("PK…") and OCP payload ("MJH"), with
@@ -750,14 +789,17 @@ func TestCLIConvertRoundTripPixelExact(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("back PNG failed to decode: %v", derr)
 	}
-	if back.Bounds().Dx() != 640 || back.Bounds().Dy() != 400 {
-		t.Fatalf("back PNG dims = %dx%d, want 640x400", back.Bounds().Dx(), back.Bounds().Dy())
+	// SCR → PNG emits a mode-1 screen at its own resolution, so the round trip
+	// comes back at half the canvas: every second source pixel, still exact.
+	if back.Bounds().Dx() != 320 || back.Bounds().Dy() != 200 {
+		t.Fatalf("back PNG dims = %dx%d, want 320x200 (the screen's own resolution)",
+			back.Bounds().Dx(), back.Bounds().Dy())
 	}
 
 	mismatches := 0
-	for y := 0; y < 400 && mismatches < 5; y++ {
-		for x := 0; x < 640 && mismatches < 5; x++ {
-			c1 := color.RGBAModel.Convert(src.At(x, y)).(color.RGBA)
+	for y := 0; y < 200 && mismatches < 5; y++ {
+		for x := 0; x < 320 && mismatches < 5; x++ {
+			c1 := color.RGBAModel.Convert(src.At(2*x, 2*y)).(color.RGBA)
 			c2 := color.RGBAModel.Convert(back.At(x, y)).(color.RGBA)
 			if c1.R != c2.R || c1.G != c2.G || c1.B != c2.B {
 				mismatches++
@@ -1187,8 +1229,8 @@ func TestCLIPackUnderscanPlusRoundTrip(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("PNG failed to decode: %v", derr)
 	}
-	if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
-		t.Errorf("underscan Plus PNG is %dx%d, want 512x384", got.Dx(), got.Dy())
+	if got := img.Bounds(); got.Dx() != 256 || got.Dy() != 192 {
+		t.Errorf("underscan Plus PNG is %dx%d, want 256x192 (64x192 at the screen's own resolution)", got.Dx(), got.Dy())
 	}
 	paletted, ok := img.(*image.Paletted)
 	if !ok {
@@ -1243,8 +1285,8 @@ func TestCLIConvertRealPackedScreens(t *testing.T) {
 	}
 
 	paletted := decodeIndexedPNG(t, outPath)
-	if got := paletted.Bounds(); got.Dx() != 640 || got.Dy() != 400 {
-		t.Errorf("PNG is %dx%d, want 640x400 (a standard screen)", got.Dx(), got.Dy())
+	if got := paletted.Bounds(); got.Dx() != 320 || got.Dy() != 200 {
+		t.Errorf("PNG is %dx%d, want 320x200 (a standard screen at its own resolution)", got.Dx(), got.Dy())
 	}
 	if len(paletted.Palette) != 16 {
 		t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
@@ -1291,8 +1333,8 @@ func TestCLIConvertUnderscanSCRToPNG(t *testing.T) {
 	if derr != nil {
 		t.Fatalf("PNG failed to decode: %v", derr)
 	}
-	if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
-		t.Errorf("underscan PNG is %dx%d, want 512x384 (64x192 code space)", got.Dx(), got.Dy())
+	if got := img.Bounds(); got.Dx() != 256 || got.Dy() != 192 {
+		t.Errorf("underscan PNG is %dx%d, want 256x192 (64x192 code space)", got.Dx(), got.Dy())
 	}
 
 	// The palette must be the ModePal read at 0x17D0, in pen order.
@@ -1319,6 +1361,194 @@ func TestCLIConvertUnderscanSCRToPNG(t *testing.T) {
 			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (ink %d)",
 				pen, got.R, got.G, got.B, want, ink)
 		}
+	}
+}
+
+// TestCLIConvertSCRToPNGGeometry pins the size every screen shape is emitted at.
+// The renderer draws on a 640-dot display canvas, so the PNG comes out at the
+// screen's own resolution: the canvas halved for modes 0 and 1 (320x200
+// standard, 256x192 underscan, 384x272 overscan) and whole for mode 2, whose
+// pixels are one canvas dot wide (640x400 / 512x384 / 768x544).
+func TestCLIConvertSCRToPNGGeometry(t *testing.T) {
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	for _, tc := range []struct {
+		name           string
+		numCol, numLig int
+		mode           int
+		wantW, wantH   int
+	}{
+		{"standard 80x200 mode 0", cpc.StandardCols, cpc.StandardLines, 0, 320, 200},
+		{"underscan 64x192 mode 0", cpc.UnderscanCols, cpc.UnderscanLines, 0, 256, 192},
+		{"overscan 96x272 mode 0", cpc.OverscanCols, cpc.OverscanLines, 0, 384, 272},
+		{"standard 80x200 mode 1", cpc.StandardCols, cpc.StandardLines, 1, 320, 200},
+		{"underscan 64x192 mode 1", cpc.UnderscanCols, cpc.UnderscanLines, 1, 256, 192},
+		{"overscan 96x272 mode 1", cpc.OverscanCols, cpc.OverscanLines, 1, 384, 272},
+		{"standard 80x200 mode 2", cpc.StandardCols, cpc.StandardLines, 2, 640, 400},
+		{"underscan 64x192 mode 2", cpc.UnderscanCols, cpc.UnderscanLines, 2, 512, 384},
+		{"overscan 96x272 mode 2", cpc.OverscanCols, cpc.OverscanLines, 2, 768, 544},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			inPath := filepath.Join(dir, "screen.scr")
+			// No AMSDOS header: the payload size is the only thing that says
+			// which geometry this is.
+			if err := os.WriteFile(inPath, syntheticSCR(tc.numCol, tc.numLig, tc.mode), 0644); err != nil {
+				t.Fatalf("write screen failed: %v", err)
+			}
+
+			outPath := filepath.Join(dir, "screen.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert SCR -> PNG failed: %v", err)
+			}
+
+			img := decodeIndexedPNG(t, outPath)
+			if got := img.Bounds(); got.Dx() != tc.wantW || got.Dy() != tc.wantH {
+				t.Errorf("PNG is %dx%d, want %dx%d", got.Dx(), got.Dy(), tc.wantW, tc.wantH)
+			}
+			if len(img.Palette) != 16 {
+				t.Errorf("palette entries = %d, want 16 (an indexed PNG in pen order)", len(img.Palette))
+			}
+		})
+	}
+}
+
+// TestCLIConvertOverscanSCRToPNG renders a synthetic overscan dump in full: the
+// lines past 255 live past the 16 KB a loader that reads only the first half of
+// the payload would copy, so a blank lower half is the truncation signature. The
+// AMSDOS load address (&0200) is a second, independent overscan signal.
+func TestCLIConvertOverscanSCRToPNG(t *testing.T) {
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	// A marker byte in the second half of the payload — line 264 addresses past
+	// the 16 KB a truncated load would read — with its leftmost pixel at pen 1
+	// and the rest of the byte at pen 0: rendering it proves the whole payload
+	// reached the renderer, and pins where the bits land.
+	const markerLine, markerCol = 264, 5
+
+	for _, tc := range []struct {
+		name         string
+		mode         int
+		headered     bool
+		wantW, wantH int
+	}{
+		{"mode 0", 0, false, 384, 272},
+		{"mode 1", 1, false, 384, 272},
+		{"mode 2", 2, false, 768, 544},
+		{"mode 0 with AMSDOS header", 0, true, 384, 272},
+		{"mode 2 with AMSDOS header", 2, true, 768, 544},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			payload := syntheticSCR(cpc.OverscanCols, cpc.OverscanLines, tc.mode)
+			payload[markerCol+cpc.CpcAddress(markerLine*2, cpc.OverscanCols, cpc.OverscanLines)] = 0x80
+			if tc.headered {
+				payload = amsdosWrap(t, payload, 0x0200)
+			}
+			inPath := filepath.Join(dir, "screen.scr")
+			if err := os.WriteFile(inPath, payload, 0644); err != nil {
+				t.Fatalf("write screen failed: %v", err)
+			}
+
+			outPath := filepath.Join(dir, "screen.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert SCR -> PNG failed: %v", err)
+			}
+
+			img := decodeIndexedPNG(t, outPath)
+			if got := img.Bounds(); got.Dx() != tc.wantW || got.Dy() != tc.wantH {
+				t.Fatalf("PNG is %dx%d, want %dx%d", got.Dx(), got.Dy(), tc.wantW, tc.wantH)
+			}
+
+			// Where the marker byte's first two pixels land in the emitted grid:
+			// modes 0 and 1 emit one output row per line, mode 2 two.
+			firstX, secondX := markerCol*4, markerCol*4+2 // mode 0: 2 pixels per byte
+			rows := []int{markerLine}
+			switch tc.mode {
+			case 1:
+				firstX, secondX = markerCol*4, markerCol*4+1 // 4 pixels per byte
+			case 2:
+				firstX, secondX = markerCol*8, markerCol*8+1 // 8 pixels per byte
+				rows = []int{markerLine * 2, markerLine*2 + 1}
+			}
+			for _, row := range rows {
+				if got := img.ColorIndexAt(firstX, row); got != 1 {
+					t.Errorf("marker pixel (%d,%d) = pen %d, want pen 1 (the payload past line 255 must be rendered)",
+						firstX, row, got)
+				}
+				if got := img.ColorIndexAt(secondX, row); got != 0 {
+					t.Errorf("pixel after the marker (%d,%d) = pen %d, want pen 0", secondX, row, got)
+				}
+			}
+
+			pens := map[uint8]bool{}
+			for y := tc.wantH / 2; y < tc.wantH; y++ {
+				for x := 0; x < tc.wantW; x++ {
+					pens[img.ColorIndexAt(x, y)] = true
+				}
+			}
+			if len(pens) < 2 {
+				t.Errorf("lower half holds %d pens, want the picture data (a blank half means the dump was truncated)", len(pens))
+			}
+		})
+	}
+}
+
+// TestCLIConvertRejectsUnknownSCRSize verifies that a payload of no screen size
+// is refused with a non-zero exit and no output file, instead of being read as a
+// standard 80x200 screen. The sizes are exact: guessing a geometry is what used
+// to turn an overscan dump into a half-empty picture.
+func TestCLIConvertRejectsUnknownSCRSize(t *testing.T) {
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	stdSize := cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)
+
+	for _, tc := range []struct {
+		name string
+		data func(t *testing.T) []byte
+	}{
+		{"standard payload one byte short", func(*testing.T) []byte {
+			return syntheticSCR(cpc.StandardCols, cpc.StandardLines, 1)[:stdSize-1]
+		}},
+		{"standard payload one byte long", func(*testing.T) []byte {
+			return append(syntheticSCR(cpc.StandardCols, cpc.StandardLines, 1), 0)
+		}},
+		{"truncated payload wrapped in a header", func(t *testing.T) []byte {
+			return amsdosWrap(t, syntheticSCR(cpc.StandardCols, cpc.StandardLines, 1)[:stdSize-1], 0xC000)
+		}},
+		{"PKSL pixel payload (not a screen dump)", func(*testing.T) []byte {
+			// The column-major pixel buffer a PKSL header describes: 16000
+			// bytes of picture data with no screen layout and no palette.
+			return cpc.ScreenToColumnMajor(
+				syntheticSCR(cpc.StandardCols, cpc.StandardLines, 1),
+				cpc.StandardCols, cpc.StandardLines)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			inPath := filepath.Join(dir, "screen.scr")
+			if err := os.WriteFile(inPath, tc.data(t), 0644); err != nil {
+				t.Fatalf("write screen failed: %v", err)
+			}
+
+			outPath := filepath.Join(dir, "screen.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			err := rootCmd.Execute()
+			if err == nil {
+				t.Fatal("convert must reject a payload that is not a screen size")
+			}
+			if !strings.Contains(err.Error(), "payload size") {
+				t.Errorf("error should name the payload size, got: %v", err)
+			}
+			if _, serr := os.Stat(outPath); serr == nil {
+				t.Error("convert must not write an output file when it rejects the input")
+			}
+		})
 	}
 }
 
@@ -1397,9 +1627,11 @@ func TestCLIConvertUnderscanPlusRealSamples(t *testing.T) {
 		name     string
 		rel      string
 		modeByte byte
+		wantW    int
+		wantH    int
 	}{
-		{"SF2CHUNL", "mode1+/underscan_256x192/raw/SF2CHUNL.SCR", 0x8D},
-		{"GEMPAINT", "mode2+/underscan_512x192/raw/GEMPAINT.SCR", 0x8E},
+		{"SF2CHUNL", "mode1+/underscan_256x192/raw/SF2CHUNL.SCR", 0x8D, 256, 192},
+		{"GEMPAINT", "mode2+/underscan_512x192/raw/GEMPAINT.SCR", 0x8E, 512, 384},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inPath := corpusPath(t, tc.rel)
@@ -1423,8 +1655,9 @@ func TestCLIConvertUnderscanPlusRealSamples(t *testing.T) {
 			if derr != nil {
 				t.Fatalf("PNG failed to decode: %v", derr)
 			}
-			if got := img.Bounds(); got.Dx() != 512 || got.Dy() != 384 {
-				t.Errorf("PNG is %dx%d, want 512x384 (underscan code space)", got.Dx(), got.Dy())
+			if got := img.Bounds(); got.Dx() != tc.wantW || got.Dy() != tc.wantH {
+				t.Errorf("PNG is %dx%d, want %dx%d (underscan at the screen's own resolution)",
+					got.Dx(), got.Dy(), tc.wantW, tc.wantH)
 			}
 			paletted, ok := img.(*image.Paletted)
 			if !ok {
@@ -1522,6 +1755,54 @@ func TestCLIConvertPlusPaletteRealSamples(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestCLIConvertOverscanRealSamples renders real overscan screens — a 31936-byte
+// payload whose mode byte sits at &600 — and pins both the emitted size (384x272
+// for modes 0 and 1, 768x544 for mode 2) and the picture reaching the lower
+// half, which is where the lines past 255 live.
+func TestCLIConvertOverscanRealSamples(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rel      string
+		modeByte byte
+		wantW    int
+		wantH    int
+	}{
+		{"CRZCARS2 mode 0", "mode0/overscan_192x272/raw/CRZCARS2.SCR", 0x00, 384, 272},
+		{"PORSC959 mode 1", "mode1/overscan_384x272/raw/PORSC959.SCR", 0x01, 384, 272},
+		{"NASAWALK mode 2", "mode2/overscan_768x272/raw/NASAWALK.SCR", 0x02, 768, 544},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inPath := corpusPath(t, tc.rel)
+			raw := mustRead(t, inPath)
+			if got := raw[128+cpc.OverscanModePalOffset]; got != tc.modeByte {
+				t.Fatalf("mode byte at &600 = 0x%02X, want 0x%02X", got, tc.modeByte)
+			}
+
+			outPath := filepath.Join(t.TempDir(), "out.png")
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert failed: %v", err)
+			}
+
+			img := decodeIndexedPNG(t, outPath)
+			if got := img.Bounds(); got.Dx() != tc.wantW || got.Dy() != tc.wantH {
+				t.Errorf("PNG is %dx%d, want %dx%d (overscan at the screen's own resolution)",
+					got.Dx(), got.Dy(), tc.wantW, tc.wantH)
+			}
+
+			pens := map[uint8]bool{}
+			for y := tc.wantH / 2; y < tc.wantH; y++ {
+				for x := 0; x < tc.wantW; x++ {
+					pens[img.ColorIndexAt(x, y)] = true
+				}
+			}
+			if len(pens) < 2 {
+				t.Errorf("lower half holds %d pens, want the picture data (a blank half means the dump was truncated)", len(pens))
+			}
+		})
+	}
+}
+
 // F5: honouring a source palette in `convert` (indexed PNG + --palette).
 
 // resetConvertFlags clears the process-global convert flags (and the
