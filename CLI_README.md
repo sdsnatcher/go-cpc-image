@@ -18,6 +18,14 @@ This creates the `cpc-image` executable in the project root.
 
 Convert bitmap images (PNG, JPEG, BMP, GIF) to Amstrad CPC screen formats.
 
+An input file with a `.scr` extension is treated as an Amstrad CPC screen and
+converted the other way, to an **indexed-color PNG**: the palette follows the
+exact pen order stored in the screen (its ModePal block), so colours are
+preserved instead of being taken from a fixed default. A **PKS-compressed**
+screen is unpacked first — the PKS family is what `pack` writes — so
+`samples/**/pk_compressed/*.SCR` can be rendered directly; only a variant the
+engine does not implement is refused.
+
 **Basic Usage:**
 ```bash
 cpc-image convert -i photo.png -o screen.scr -m 1

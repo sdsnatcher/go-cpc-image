@@ -1526,11 +1526,31 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 		payload = data[128:]
 	}
 
-	// PKS-compressed screens carry a "PK" signature instead of raw screen
-	// data. Rendering the compressed bytes as if they were a screen would
-	// silently produce a corrupt PNG, so reject every variant explicitly.
+	// A PKS-compressed screen is unpacked first: its payload is a compressed
+	// screen dump, so rendering those bytes as if they were pixels would emit a
+	// corrupt PNG. The restored dump is exactly what a raw .SCR holds, so the
+	// rest of this function needs no special case — except that a column-major
+	// variant (PKSL, PKUL) has to be scattered back into the CPC screen layout
+	// and have its ModePal re-embedded, the same way `unpack` restores one.
 	if len(payload) >= 4 && payload[0] == 'P' && payload[1] == 'K' {
-		return fmt.Errorf("input file is PKS-compressed, which convert does not support: %s", inputFile)
+		depacked := make([]byte, 0x20000)
+		n, header, derr := compress.NewCompressor().PKS().DepackPKS(payload, depacked)
+		if derr != nil {
+			return fmt.Errorf("failed to unpack PKS input: %w", derr)
+		}
+		payload = depacked[:n]
+		if header != nil {
+			if screenSize, columnMajor := pksColumnMajorPayload(header.Variant); columnMajor {
+				screen := cpc.ColumnMajorToScreen(payload, cpc.StandardCols, cpc.StandardLines)
+				if screenSize < len(screen) {
+					screen = screen[:screenSize]
+				}
+				if anyNonZero(header.Palette[:]) {
+					screen = cpc.EmbedModePal(screen, header.Palette[:])
+				}
+				payload = screen
+			}
+		}
 	}
 
 	// Underscan dumps are 15872 bytes and their pixel addresses differ from the

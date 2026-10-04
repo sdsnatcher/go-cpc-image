@@ -770,53 +770,60 @@ func TestCLIConvertRoundTripPixelExact(t *testing.T) {
 	}
 }
 
-// TestCLIConvertRejectsPKSInput verifies that convert refuses a PKS-compressed
-// screen ("PKxx" signature) instead of feeding the compressed bytes to the
-// screen renderer, which would silently emit a corrupt PNG.
-func TestCLIConvertRejectsPKSInput(t *testing.T) {
+// TestCLIConvertRendersPackedScreens verifies that convert transparently unpacks
+// a PKS-compressed screen instead of refusing it: the restored dump is exactly
+// what the raw .SCR holds, so a packed screen renders identically to the screen
+// it was packed from, as an indexed PNG. An unsupported variant is still an
+// error, and no output is written for it.
+func TestCLIConvertRendersPackedScreens(t *testing.T) {
 	tempDir := t.TempDir()
 
-	// A real PKSL payload produced by the compressor, plus a bare "PKUL"
-	// (underscan) signature: every variant must be rejected, including those
-	// that ParsePKSHeader does not recognize.
-	raw := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
-	pksBuf := make([]byte, len(raw)*2+1024)
-	packedSize, perr := compress.NewCompressor().PKS().PackPKS(raw, len(raw), pksBuf, compress.PKSL, nil)
-	if perr != nil {
-		t.Fatalf("PackPKS failed: %v", perr)
+	// A standard screen and its packed (PKSL) form.
+	rawPath := filepath.Join(tempDir, "screen.scr")
+	if err := writeSCR(rawPath, cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines)); err != nil {
+		t.Fatalf("writeSCR failed: %v", err)
 	}
-	pkul := append([]byte("PKUL"), raw...)
-
-	cases := []struct {
-		name string
-		data []byte
-	}{
-		{"PKSL", pksBuf[:packedSize]},
-		{"PKUL", pkul},
+	pksPath := filepath.Join(tempDir, "screen.pks")
+	rootCmd.SetArgs([]string{"pack", "-i", rawPath, "-o", pksPath, "--method", "pksl"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("pack failed: %v", err)
 	}
 
-	// Keep the .scr extension: that is the route a user would actually take
-	// when pointing convert at a compressed screen dump.
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			inPath := filepath.Join(tempDir, tc.name+".scr")
-			if err := os.WriteFile(inPath, tc.data, 0644); err != nil {
-				t.Fatalf("write fixture failed: %v", err)
-			}
+	// Converting the packed screen must give the same PNG as the raw screen.
+	packedPNG := filepath.Join(tempDir, "packed.png")
+	rootCmd.SetArgs([]string{"convert", "-i", pksPath, "-o", packedPNG})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert of a packed screen failed: %v", err)
+	}
+	rawPNG := filepath.Join(tempDir, "raw.png")
+	rootCmd.SetArgs([]string{"convert", "-i", rawPath, "-o", rawPNG})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert of the raw screen failed: %v", err)
+	}
+	if a, b := mustRead(t, packedPNG), mustRead(t, rawPNG); !bytes.Equal(a, b) {
+		t.Error("a packed screen must render exactly like the screen it was packed from")
+	}
+	if paletted := decodeIndexedPNG(t, packedPNG); len(paletted.Palette) != 16 {
+		t.Errorf("palette entries = %d, want 16 (an indexed PNG)", len(paletted.Palette))
+	}
 
-			outPath := filepath.Join(tempDir, tc.name+".png")
-			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
-			err := rootCmd.Execute()
-			if err == nil {
-				t.Fatal("convert on a PKS-compressed screen should fail")
-			}
-			if !strings.Contains(err.Error(), "PKS") {
-				t.Errorf("error should mention PKS, got: %v", err)
-			}
-			if _, serr := os.Stat(outPath); serr == nil {
-				t.Error("convert must not write an output file for rejected PKS input")
-			}
-		})
+	// A "PK" payload naming a variant the engine does not implement is still
+	// rejected, with nothing written: only real packed screens are unpacked.
+	unknownPath := filepath.Join(tempDir, "unknown.scr")
+	if err := os.WriteFile(unknownPath, append([]byte("PKZZ"), make([]byte, 64)...), 0644); err != nil {
+		t.Fatalf("write fixture failed: %v", err)
+	}
+	unknownPNG := filepath.Join(tempDir, "unknown.png")
+	rootCmd.SetArgs([]string{"convert", "-i", unknownPath, "-o", unknownPNG})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("convert must fail on an unsupported PKS variant")
+	}
+	if !strings.Contains(err.Error(), "unpack PKS") {
+		t.Errorf("error should report the failed unpack, got: %v", err)
+	}
+	if _, serr := os.Stat(unknownPNG); serr == nil {
+		t.Error("convert must not write an output file for an unsupported variant")
 	}
 }
 
@@ -1218,6 +1225,50 @@ func corpusPath(t *testing.T, rel string) string {
 	return p
 }
 
+// TestCLIConvertRealPackedScreens pins the reported command: a screen taken
+// straight from the corpus' pk_compressed directory must render, not be refused.
+// The palette travels in the PKS header of a PKSL payload, so the output must
+// also carry the screen's own pens, not a default-palette guess.
+func TestCLIConvertRealPackedScreens(t *testing.T) {
+	resetConvertFlags(t)
+	defer resetConvertFlags(t)
+
+	inPath := corpusPath(t, "mode0/standard_160x200/pk_compressed/3DFIGHT.SCR")
+	outPath := filepath.Join(t.TempDir(), "packed.png")
+
+	rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath, "-f", "png"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("convert of a packed screen failed: %v", err)
+	}
+
+	paletted := decodeIndexedPNG(t, outPath)
+	if got := paletted.Bounds(); got.Dx() != 640 || got.Dy() != 400 {
+		t.Errorf("PNG is %dx%d, want 640x400 (a standard screen)", got.Dx(), got.Dy())
+	}
+	if len(paletted.Palette) != 16 {
+		t.Fatalf("palette entries = %d, want 16", len(paletted.Palette))
+	}
+
+	// Every pen must be the colour the PKS header names, in the same order.
+	raw := mustRead(t, inPath)
+	if !cpc.CheckAmsdos(raw) {
+		t.Fatal("packed sample has no AMSDOS header")
+	}
+	header, err := compress.ParsePKSHeader(raw[128:])
+	if err != nil {
+		t.Fatalf("ParsePKSHeader failed: %v", err)
+	}
+	for pen := 0; pen < 16; pen++ {
+		ink := int(header.Palette[1+pen])
+		want := cpc.PaletteColor(ink, false)
+		got := palettedRGB(t, paletted.Palette, pen)
+		if int(got.R) != (want>>16)&0xFF || int(got.G) != (want>>8)&0xFF || int(got.B) != want&0xFF {
+			t.Errorf("pen %d colour = #%02X%02X%02X, want #%06X (header ink %d)",
+				pen, got.R, got.G, got.B, want, ink)
+		}
+	}
+}
+
 // TestCLIConvertUnderscanSCRToPNG verifies that a raw underscan screen is
 // rendered with the underscan geometry and with the palette embedded at
 // 0x17D0, instead of the standard 80x200 layout.
@@ -1474,7 +1525,7 @@ func TestCLIConvertPlusPaletteRealSamples(t *testing.T) {
 
 // resetConvertFlags clears the process-global convert flags (and the
 // persistent --verbose) that an earlier Execute() in this package may have set,
-// so each test starts from the defaults. Tests that set --plus/--overscan/-v
+// so each test starts from the defaults. Tests that set --plus/--overscan/-f/-v
 // call it with defer.
 func resetConvertFlags(t *testing.T) {
 	t.Helper()
@@ -1486,6 +1537,11 @@ func resetConvertFlags(t *testing.T) {
 	}
 	if err := convertCmd.Flags().Set("overscan", "false"); err != nil {
 		t.Fatalf("reset --overscan failed: %v", err)
+	}
+	// `-f png` with a bitmap input goes through the (unimplemented) PNG writer,
+	// so leaking it would break later PNG -> SCR tests.
+	if err := convertCmd.Flags().Set("format", "scr"); err != nil {
+		t.Fatalf("reset --format failed: %v", err)
 	}
 	if err := rootCmd.PersistentFlags().Set("verbose", "false"); err != nil {
 		t.Fatalf("reset --verbose failed: %v", err)

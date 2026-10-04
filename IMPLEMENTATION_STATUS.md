@@ -18,6 +18,12 @@
 
 #### Convert Command ✅
 - **Input formats:** PNG, JPEG, BMP, GIF support
+- **SCR input:** a `.scr` file is a CPC screen, not a bitmap: it is rendered back
+  to an **indexed-color PNG** whose PLTE follows the screen's ModePal pen order.
+  A **PKS-compressed** screen (`*.pks`, or a packed sample under
+  `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
+  the packed and raw forms of a screen give identical PNGs; a variant the PKS
+  engine does not implement fails with a non-zero exit and writes nothing
 - **CPC modes:** 0, 1, 2 with proper validation
 - **Dithering methods:** All 11 methods from original (floyd-steinberg, bayer1-3, ordered1-3, zigzag1-3, none)
 - **Advanced options:**
