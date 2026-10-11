@@ -29,7 +29,11 @@
   read; a payload of no screen size is refused (non-zero exit, nothing written).
   The PNG is emitted at the screen's own resolution: 320x200 / 256x192 / 384x272
   for modes 0 and 1 and 640x400 / 512x384 / 768x544 for mode 2, so the renderer's
-  640-dot canvas is halved instead of written out as it is.
+  640-dot canvas is halved instead of written out as it is. Every screen PNG also
+  declares the density of that grid in a `pHYs` chunk (unit 1, pixels per metre,
+  right after IHDR) — the density of one CPC pixel times how many file pixels it was
+  written as, ~36 DPI for a mode-1 pixel — so a viewer that honours the chunk has the
+  picture's real shape; `-v` reports what was declared.
 - **PNG→SCR geometry:** `--geometry auto|standard|underscan|overscan` (default
   `auto`; `--overscan` is kept as an alias) selects the scan area, and `auto` reads
   it from the input's pixel size against the canvas, emitted and native grids —
@@ -38,8 +42,9 @@
   `pack --method pkul` compresses; `--resize fit|keepsmaller|keeplarger|origin`
   decides how the source is fitted onto that grid.
 - **Screen PNG output knobs:** `--native` drops the PAR pre-compensation (the
-  picture is written on the screen's own grid — raw pixels) and `--scale N` zooms
-  by a whole factor after it, so no resampling is ever involved.
+  picture is written on the screen's own grid — raw pixels, whose density the file
+  declares) and `--scale N` zooms by a whole factor after it, so no resampling is ever
+  involved.
   A **PKS-compressed** screen (`*.pks`, or a packed sample under
   `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
   the packed and raw forms of a screen give identical PNGs; a variant the PKS

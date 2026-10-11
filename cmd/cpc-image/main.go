@@ -10,7 +10,7 @@ import (
 	"image/color"
 	_ "image/gif"  // Register GIF decoder
 	_ "image/jpeg" // Register JPEG decoder
-	"image/png"    // PNG decoder and encoder
+	_ "image/png"  // Register PNG decoder (writing one goes through pkg/fileio)
 	"io"
 	"os"
 	"path/filepath"
@@ -190,7 +190,7 @@ func init() {
 	convertCmd.Flags().StringVar(&resizePolicy, "resize", "fit",
 		fmt.Sprintf("how the source is mapped onto the screen (%s)", strings.Join(resizePolicies, ", ")))
 	convertCmd.Flags().BoolVar(&nativeOut, "native", false,
-		"write a screen PNG at the screen's own resolution (raw pixels: no PAR compensation of its own)")
+		"write a screen PNG at the screen's own resolution (raw pixels: the grid itself carries no aspect correction, so a viewer that ignores the declared pixel density shows it stretched)")
 	convertCmd.Flags().IntVar(&scaleFactor, "scale", 1,
 		"zoom a screen PNG by a whole factor, applied after the PAR step")
 	convertCmd.Flags().BoolVar(&plus, "plus", false, "CPC Plus mode (4096 colors)")
@@ -1879,9 +1879,16 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer file.Close()
-	// Indexed-color PNG whose palette follows the SCR pen order.
-	if err := png.Encode(file, rgbaToIndexed(img, bmp.Palette, bmp.CpcPlus)); err != nil {
+	// Indexed-color PNG whose palette follows the SCR pen order, plus the density of
+	// the grid it was written at: every screen PNG declares one, so a viewer that
+	// honours the chunk shows the picture with its real shape.
+	ppux, ppuy := pixelDensity(numCol, numLig, bmp.VirtualMode, nativeOut, scaleFactor)
+	if err := fileio.WritePNGWithDensity(file, rgbaToIndexed(img, bmp.Palette, bmp.CpcPlus), ppux, ppuy); err != nil {
 		return fmt.Errorf("failed to encode PNG: %w", err)
+	}
+	if verbose && warn != nil {
+		fmt.Fprintf(warn, "Pixel density: %d x %d pixels/meter (%d x %d dpi)\n",
+			ppux, ppuy, densityInDPI(ppux), densityInDPI(ppuy))
 	}
 
 	fileInfo, _ := os.Stat(outputFile)

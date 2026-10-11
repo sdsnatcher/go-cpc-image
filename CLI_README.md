@@ -55,6 +55,21 @@ canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 /
 768x544 for mode 2. Scaling is nearest neighbour, so no pen colour is blended or
 invented, and the canvas's pixel aspect is preserved.
 
+Every screen PNG also **declares the density of the grid it holds**, in the file's
+`pHYs` chunk (unit 1, pixels per metre), so a viewer that honours the chunk has the
+picture's real shape. The pair is the density of ONE PIXEL OF THE FILE, built from
+the density of one CPC pixel — a mode-1 (square) pixel is taken as ~36 DPI, and the
+modes divide the same pixel clock, so a mode-0 pixel is half that across and a mode-2
+one twice it — multiplied by however many file pixels that CPC pixel was written as.
+Names aside, the rule is: a mode-1 grid declares 1416 x 1416; a mode-0 default grid
+declares the same, because writing its pixels twice across squares the 708 it starts
+from; a mode-2 default grid declares 2832 x 2832, since it keeps the whole canvas and
+so puts every CPC line on two rows of half the height; a `--native` grid declares the
+mode's own pair (708 x 1416, 1416 x 1416, 2832 x 1416), and `--scale N` multiplies
+both values, because magnifying the file does not magnify the screen. Nothing else is
+claimed — a density, never a size — and most viewers ignore the chunk, which is why
+the PAR grid is still the shape that travels. `-v` reports what was declared.
+
 **Basic Usage:**
 ```bash
 cpc-image convert -i photo.png -o screen.scr -m 1
@@ -73,7 +88,8 @@ cpc-image convert -i photo.png -o screen.scr -m 1
   `keeplarger` (keep aspect, centre, and crop) or `origin` (no scaling: draw at
   0,0 and clip), case-insensitive
 - `--native` - Write a screen PNG at the screen's own resolution instead of the
-  PAR-pre-compensated grid (raw pixels: it carries no aspect correction of its own)
+  PAR-pre-compensated grid (raw pixels: the grid itself carries no aspect correction,
+  so a viewer that ignores the declared pixel density shows it stretched)
 - `--scale` - Zoom a screen PNG by a whole factor (default: 1), applied after the
   PAR step
 - `--plus` - Use CPC Plus mode (4096 colors instead of 27)

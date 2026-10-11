@@ -34,10 +34,11 @@ func screenPNGSize(t *testing.T, dumpPath, dir string, args ...string) (int, int
 
 // TestCLIConvertScreenOutputKnobs pins the two output knobs against the sizes the
 // design fixes: by default a screen PNG is written on the PAR-pre-compensated
-// grid, --native writes the screen's own pixels (no compensation, so "raw
-// pixels" with no aspect correction of their own) and --scale zooms whatever the
-// previous step produced by a whole factor. The expected numbers are the table
-// the design states, written out here rather than recomputed.
+// grid, --native writes the screen's own pixels (no pre-compensation, so a grid
+// that carries no aspect correction of its own apart from the density it declares)
+// and --scale zooms whatever the previous step produced by a whole factor. The
+// expected numbers are the table the design states, written out here rather than
+// recomputed.
 func TestCLIConvertScreenOutputKnobs(t *testing.T) {
 	cases := []struct {
 		name       string
