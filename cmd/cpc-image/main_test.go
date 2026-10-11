@@ -1868,7 +1868,7 @@ func TestCLIConvertOverscanRealSamples(t *testing.T) {
 	}
 }
 
-// F5: honouring a source palette in `convert` (indexed PNG + --palette).
+// Honouring a source palette in `convert` (indexed PNG and --palette).
 
 // resetConvertFlags clears the process-global convert flags (and the
 // persistent --verbose) that an earlier Execute() in this package may have set,
@@ -2461,10 +2461,10 @@ func TestCLIConvertIndexedPNGEntryCount(t *testing.T) {
 	}
 }
 
-// TestCLIConvertPaletteRoundTripPenExact verifies the goal of F5: an SCR -> PNG
-// -> SCR round trip keeps the pen order of the original when --palette pins it,
-// while the same round trip without the flag does not (today's behaviour, which
-// re-derives the pens by frequency).
+// TestCLIConvertPaletteRoundTripPenExact verifies the point of pinning a palette:
+// an SCR -> PNG -> SCR round trip keeps the pen order of the original when
+// --palette pins it, while the same round trip without the flag does not (today's
+// behaviour, which re-derives the pens by frequency).
 func TestCLIConvertPaletteRoundTripPenExact(t *testing.T) {
 	tempDir := t.TempDir()
 	defer resetConvertFlags(t)
@@ -2511,8 +2511,8 @@ func TestCLIConvertPaletteRoundTripPenExact(t *testing.T) {
 		t.Errorf("round trip with --palette = % x, want % x", locked[:5], original[:5])
 	}
 
-	// Without the flag the F1 indexed PNG (16 entries in mode 1) is over budget,
-	// so the pens are re-derived by frequency: the order is not preserved.
+	// Without the flag the source's indexed palette (16 entries in mode 1) is over
+	// budget, so the pens are re-derived by frequency: the order is not preserved.
 	// (--palette is a process-global: clear it, otherwise the previous run's
 	// value would still be in effect.)
 	stderr.Reset()
