@@ -3151,3 +3151,165 @@ func TestCLIPackKeepsZeroedPrefix(t *testing.T) {
 		})
 	}
 }
+
+// TestCLICMPRealSamples reads the corpus' "écran compacté" files, which the
+// original tool writes as an AMSDOS header plus a Standard (LZW) compressed
+// screen. `unpack` must restore the same pixels as the paired raw .SCR, and
+// `convert` must render the same PNG from either form. Code and palette live in
+// the dump itself, and the layout gaps are not compared: a raw screen keeps its
+// display code there while a compressed dump has them zeroed.
+func TestCLICMPRealSamples(t *testing.T) {
+	root := os.Getenv(corpusSamplesEnv)
+	if root == "" {
+		t.Skipf("set %s to run the corpus-driven tests", corpusSamplesEnv)
+	}
+
+	// Index the raw screens as <mode dir>/<base name>: a .CMP pairs with the raw
+	// screen of its own mode directory, in whichever sibling directory it sits
+	// (raw/, raw1/, raw+pal/, ...) — never with the packed file or with the CPC
+	// Plus variant of another directory, which hold different pictures.
+	raws := map[string]string{}
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, werr error) error {
+		if werr != nil || d.IsDir() || !strings.EqualFold(filepath.Ext(path), ".scr") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) < 4 || parts[2] == "cmp" || parts[2] == "pk_compressed" {
+			return nil
+		}
+		if key := parts[0] + "/" + filepath.Base(path); raws[key] == "" {
+			raws[key] = path
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("walking the corpus failed: %v", walkErr)
+	}
+
+	cmps, _ := filepath.Glob(filepath.Join(root, "mode*", "*", "cmp", "*.CMP"))
+	if len(cmps) == 0 {
+		t.Skipf("no .CMP samples available under %s", root)
+	}
+
+	checked := 0
+	for _, cmpPath := range cmps {
+		name := filepath.Base(cmpPath)
+		rel, rerr := filepath.Rel(root, cmpPath)
+		if rerr != nil {
+			continue
+		}
+		modeDir := strings.Split(rel, string(filepath.Separator))[0]
+		rawPath, ok := raws[modeDir+"/"+strings.TrimSuffix(name, ".CMP")+".SCR"]
+		if !ok {
+			t.Logf("%s: no raw screen in %s to compare with; skipped", name, modeDir)
+			continue
+		}
+
+		rawData := mustRead(t, rawPath)
+		rawPayload := rawData
+		if len(rawData) >= 128 && cpc.CheckAmsdos(rawData) {
+			rawPayload = rawData[128:]
+		}
+
+		// (1) unpack: the same dump as the raw screen, pixel for pixel.
+		outSCR := filepath.Join(t.TempDir(), name+".scr")
+		rootCmd.SetArgs([]string{"unpack", "-i", cmpPath, "-o", outSCR})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("%s: unpack failed: %v", name, err)
+		}
+		restored := mustRead(t, outSCR)
+		if len(restored) != len(rawPayload) {
+			t.Fatalf("%s: restored %d bytes, the raw payload is %d", name, len(restored), len(rawPayload))
+		}
+		numCol, numLig, known := scrGeometry(len(restored))
+		if !known {
+			t.Fatalf("%s: unpack restored %d bytes, which is not a screen dump", name, len(restored))
+		}
+		if !bytes.Equal(cpc.ScreenToColumnMajor(restored, numCol, numLig),
+			cpc.ScreenToColumnMajor(rawPayload, numCol, numLig)) {
+			t.Errorf("%s: the restored dump's pixels differ from the raw screen", name)
+		}
+
+		// (2) convert: the same PNG from the compressed and the raw form.
+		resetConvertFlags(t)
+		cmpPNG := filepath.Join(t.TempDir(), name+".png")
+		rootCmd.SetArgs([]string{"convert", "-i", cmpPath, "-o", cmpPNG})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("%s: convert of the .CMP failed: %v", name, err)
+		}
+		rawPNG := filepath.Join(t.TempDir(), name+"_raw.png")
+		rootCmd.SetArgs([]string{"convert", "-i", rawPath, "-o", rawPNG})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("%s: convert of the raw screen failed: %v", name, err)
+		}
+		resetConvertFlags(t)
+
+		fromCmp := decodeIndexedPNG(t, cmpPNG)
+		fromRaw := decodeIndexedPNG(t, rawPNG)
+		if fromCmp.Bounds() != fromRaw.Bounds() {
+			t.Fatalf("%s: PNG sizes differ: %v vs %v", name, fromCmp.Bounds(), fromRaw.Bounds())
+		}
+		for y := fromCmp.Bounds().Min.Y; y < fromCmp.Bounds().Max.Y; y++ {
+			for x := fromCmp.Bounds().Min.X; x < fromCmp.Bounds().Max.X; x++ {
+				if fromCmp.ColorIndexAt(x, y) != fromRaw.ColorIndexAt(x, y) {
+					t.Fatalf("%s: the render of the .CMP differs from the raw screen's at (%d,%d)", name, x, y)
+				}
+			}
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Skip("no .CMP/raw pairs available")
+	}
+	t.Logf("checked %d real CMP samples", checked)
+}
+
+// TestCLICMPUnsupportedMethod pins the refusal of a "compacté" screen saved with
+// a method this tool cannot read. The method is not recorded in the file, so a
+// ZX0 save is indistinguishable from a corrupt or unrelated stream: both
+// commands must say which method is supported instead of rendering garbage, and
+// neither may write a file.
+func TestCLICMPUnsupportedMethod(t *testing.T) {
+	screen := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	packed := make([]byte, len(screen)*2+1024)
+	n, err := compress.NewCompressor().Pack(screen, len(screen), packed, 0, compress.MethodZX0)
+	if err != nil {
+		t.Fatalf("ZX0 pack failed: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	inPath := filepath.Join(tempDir, "screen.cmp")
+	if werr := os.WriteFile(inPath, amsdosWrap(t, packed[:n], 0xC000), 0644); werr != nil {
+		t.Fatalf("write fixture failed: %v", werr)
+	}
+
+	outPNG := filepath.Join(tempDir, "out.png")
+	outSCR := filepath.Join(tempDir, "out.scr")
+	for _, tc := range []struct {
+		command string
+		out     string
+	}{
+		{"convert", outPNG},
+		{"unpack", outSCR},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			resetConvertFlags(t)
+			defer resetConvertFlags(t)
+			rootCmd.SetArgs([]string{tc.command, "-i", inPath, "-o", tc.out})
+			err := rootCmd.Execute()
+			if err == nil {
+				t.Fatal("a ZX0 .CMP was accepted")
+			}
+			if !strings.Contains(err.Error(), "Standard (LZW)") {
+				t.Errorf("error does not name the supported method: %v", err)
+			}
+			if _, serr := os.Stat(tc.out); serr == nil {
+				t.Errorf("a file was written for an unsupported .CMP")
+			}
+		})
+	}
+}

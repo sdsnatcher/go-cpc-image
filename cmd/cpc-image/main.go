@@ -226,10 +226,12 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("input file does not exist: %s", inputFile)
 	}
 
-	// If the file is an .SCR input is a CPC screen file, not a bitmap image, route it
-	// to the SCR -> PNG converter instead of image.Decode (which only handles
-	// PNG/JPEG/GIF).
-	if strings.ToLower(filepath.Ext(inputFile)) == ".scr" {
+	// An .SCR is a CPC screen dump and a .CMP is the same dump compressed with
+	// the Standard (LZW) method of the original tool: both are rendered here
+	// instead of going through image.Decode, which only handles PNG/JPEG/GIF.
+	// Anything else is a bitmap, with a fallback to this path when decoding it
+	// fails (a headerless screen under a neutral extension).
+	if ext := strings.ToLower(filepath.Ext(inputFile)); ext == ".scr" || ext == ".cmp" {
 		return convertSCRToPNG(inputFile, outputFile, cmd.ErrOrStderr(), verbose)
 	}
 
@@ -812,6 +814,11 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 			method = "pks"
 		} else if len(payload) >= 4 && payload[0] == 'M' && payload[1] == 'J' && payload[2] == 'H' {
 			method = "ocp"
+		} else if strings.EqualFold(filepath.Ext(inputFile), ".cmp") {
+			// A .CMP is a compressed screen by definition, so the extension
+			// decides here and the raw-SCR guard below does not apply: a CMP
+			// whose header claims a screen load address is still a CMP.
+			method = "lzw"
 		} else if looksLikeRawSCR(inputData) {
 			// A raw (uncompressed) SCR submitted to the auto-detect path is
 			// rejected up-front: unpacking it would produce garbage.
@@ -828,14 +835,25 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 	var outputSize int
 	switch method {
 	case "lzw":
-		outputSize, err = compressor.Depack(inputData, 0, outputBuffer, compress.Standard)
+		// An LZW stream behind an AMSDOS header — a .CMP, which is what the
+		// original tool writes for a compressed screen — is decompressed
+		// behind that header, exactly like the OCP and PKS branches below
+		// do; a bare LZW file has no header and starts at offset zero.
+		payload := inputData
+		if len(inputData) >= 128 && cpc.CheckAmsdos(inputData) {
+			payload = inputData[128:]
+			if verbose {
+				fmt.Println("AMSDOS header detected; decompressing the payload")
+			}
+		}
+		outputSize, err = compressor.Depack(payload, 0, outputBuffer, compress.Standard)
 		if err != nil {
 			return fmt.Errorf("LZW decompression failed: %w", err)
 		}
 		// An explicit LZW unpack of a raw (uncompressed) input "succeeds" with
 		// the input echoed back unchanged — a trivial round-trip that would
 		// silently produce garbage. Reject it.
-		if bytes.Equal(outputBuffer[:outputSize], inputData) {
+		if bytes.Equal(outputBuffer[:outputSize], payload) {
 			return fmt.Errorf("unpack: input file does not appear to be compressed (trivial round-trip): %s", inputFile)
 		}
 		// Guard against feeding an unsupported/non-LZW file into the LZW
@@ -845,6 +863,9 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 		// (16000). An output that matches none of those sizes is treated as
 		// corrupt.
 		if !isKnownScreenSize(outputSize) {
+			if strings.EqualFold(filepath.Ext(inputFile), ".cmp") {
+				return fmt.Errorf("unpack: %s decompresses to %d bytes, not a CPC screen dump: a .CMP has to be saved with the Standard (LZW) method, a ZX0/ZX1 save cannot be read", inputFile, outputSize)
+			}
 			return fmt.Errorf("unpack: LZW output (%d bytes) is not a recognized CPC screen size; input is not a supported compressed file: %s", outputSize, inputFile)
 		}
 
@@ -1658,6 +1679,25 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 	addr := uint16(0)
 	if p, a, ok := screenAmsdosPayload(data); ok {
 		payload, addr = p, a
+	}
+
+	// A .CMP ("écran compacté") holds that dump compressed with the original
+	// tool's Standard method, which is the same LZW as the PKS core: depack it
+	// so the rest of this function sees a plain dump. The method is not recorded
+	// in the file, so a save made with the ZX0 or ZX1 method cannot be told apart
+	// from a corrupt one — it is refused with that explanation rather than
+	// rendered as garbage.
+	if strings.EqualFold(filepath.Ext(inputFile), ".cmp") {
+		depacked := make([]byte, 0x20000)
+		n, derr := compress.NewCompressor().Depack(payload, 0, depacked, compress.Standard)
+		if derr != nil {
+			return fmt.Errorf("failed to decompress CMP input: %w", derr)
+		}
+		if _, _, known := scrGeometry(n); !known {
+			return fmt.Errorf("CMP file decompresses to %d bytes, not a CPC screen dump: a .CMP has to be saved with the Standard (LZW) method, a ZX0/ZX1 save cannot be read: %s",
+				n, inputFile)
+		}
+		payload = depacked[:n]
 	}
 
 	// A PKS-compressed screen is unpacked first: its payload is a compressed

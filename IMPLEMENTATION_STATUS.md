@@ -34,6 +34,12 @@
   `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
   the packed and raw forms of a screen give identical PNGs; a variant the PKS
   engine does not implement fails with a non-zero exit and writes nothing
+- **`.cmp` input:** the original tool's "écran compacté" — an AMSDOS header plus
+  the screen compressed with its *Standard* method, the same LZW as the PKS core —
+  is decompressed behind the header and rendered like the raw screen it holds
+  (the corpus' compressed and raw forms of a picture give identical PNGs). The
+  method is not recorded in the file, so a ZX0/ZX1 save is refused with a message
+  naming the Standard method instead of being rendered as garbage
 - **AMSDOS header rule (shared with `pack`):** a 128-byte prefix is taken for a
   header when its *fields* say so — a printable 8.3 name, a file type of 0, 1 or 2
   — and its checksum confirms it. The name is the test that keeps arbitrary data
@@ -94,7 +100,11 @@
 - **Decompression methods:** lzw, ocp, and the PKS family (pks, pksl, pks3,
   pksp, pkvl, pkvp, pkul, pku3, pkup)
 - **Auto-detection** from file header when `--method` is omitted (`PK` → pks;
-  MJH → ocp; otherwise lzw)
+  MJH → ocp; a `.cmp` extension → lzw; otherwise lzw)
+- **`.cmp` reading:** a headered LZW stream ("écran compacté") is decompressed
+  behind its AMSDOS header, so `unpack -i screen.cmp -o screen.scr` restores the
+  dump; the extension selects LZW before the raw-SCR guard, and an unsupported
+  ZX0/ZX1 save is refused with a message that names the Standard method
 - **PKSL/PKUL round-trip:** the column-major payload is scattered back with the
   geometry its length names — 16000 bytes for a standard 80x200 screen, 12288 for
   an underscan 64x192 one — and the embedded ModePal is re-written at `&17D0`. A

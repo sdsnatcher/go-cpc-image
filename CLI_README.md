@@ -31,6 +31,13 @@ screen is unpacked first — the PKS family is what `pack` writes — so
 `samples/**/pk_compressed/*.SCR` can be rendered directly; only a variant the
 engine does not implement is refused.
 
+A **`.cmp` input** — the original tool's "écran compacté": an AMSDOS header plus
+the screen compressed with its *Standard* method, the same LZW the PKS core uses —
+is decompressed first and rendered exactly like the raw screen it holds. The
+method is not recorded in the file, so a save made with the ZX0 or ZX1 methods
+cannot be told apart from a corrupt stream: it is refused with a message saying so
+rather than rendered as garbage.
+
 The geometry comes from the payload size and the whole payload is rendered: a
 16336-byte dump is a standard 80x200 screen, a 15872-byte one an underscan
 64x192 screen, and a 31936-byte one an **overscan** 96x272 screen (mode byte and
@@ -230,8 +237,12 @@ header. For any other extension, a valid AMSDOS header with a screen load
 
 Decompress files compressed with LZW, OCP or the PKS family. When `--method` is
 omitted, the format is **auto-detected** from the file header: a `PK` payload
-selects PKS, an `MJH` payload selects OCP, and everything else is assumed to be
-LZW.
+selects PKS, an `MJH` payload selects OCP, a `.cmp` extension selects LZW (a
+compressed screen is the only thing that extension can name), and everything else
+is assumed to be LZW. A `.cmp` file — the original tool's "écran compacté", an
+AMSDOS header plus a *Standard* (LZW) compressed screen — is read behind its
+header, like the PKS payloads are; a save made with the ZX0 or ZX1 methods is
+refused with an explanation, since the method is not recorded in the file.
 
 **Basic Usage:**
 ```bash
