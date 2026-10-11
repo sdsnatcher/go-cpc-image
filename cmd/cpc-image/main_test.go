@@ -2939,3 +2939,154 @@ func TestCLIVersionFlag(t *testing.T) {
 		t.Errorf("--version shorthand = %q, want none (-v is --verbose)", f.Shorthand)
 	}
 }
+
+// TestCLIConvertRefusesZeroedAMSDOSHeader pins the case that motivated the
+// AMSDOS field tests: an all-zero 128-byte prefix satisfies a checksum
+// comparison (0 sums to a stored 0), so a file of zeros used to be read as a
+// headed screen — the first 128 bytes were taken for a "header" and the
+// remainder rendered as a screen sized around them. It must now be refused,
+// with a warning that says what the prefix was, and nothing written.
+func TestCLIConvertRefusesZeroedAMSDOSHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		size int
+	}{
+		{"standard-shaped zero file", cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines) + 128},
+		{"underscan-shaped zero file", cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines) + 128},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			inPath := filepath.Join(tempDir, "zeros.scr")
+			if err := os.WriteFile(inPath, make([]byte, tc.size), 0644); err != nil {
+				t.Fatalf("write fixture failed: %v", err)
+			}
+			outPath := filepath.Join(tempDir, "zeros.png")
+
+			var stderr bytes.Buffer
+			rootCmd.SetErr(&stderr)
+			defer rootCmd.SetErr(os.Stderr)
+			resetConvertFlags(t)
+			defer resetConvertFlags(t)
+
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err == nil {
+				t.Fatal("convert of a zeroed file succeeded, want a refusal")
+			}
+			if _, serr := os.Stat(outPath); serr == nil {
+				t.Error("a PNG was written for a zeroed file")
+			}
+			if !strings.Contains(stderr.String(), "zeroed AMSDOS header") {
+				t.Errorf("stderr does not explain the zeroed prefix: %q", stderr.String())
+			}
+		})
+	}
+}
+
+// TestCLIConvertWarnsOnBrokenHeader verifies the lenient reading is kept and
+// made visible: a screen whose AMSDOS checksum a writer got wrong still
+// converts with a warning naming the problem, while a screen whose header holds
+// up converts without one.
+func TestCLIConvertWarnsOnBrokenHeader(t *testing.T) {
+	payload := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	headed := amsdosWrap(t, payload, 0xC000)
+	broken := append([]byte{}, headed...)
+	broken[0x43] ^= 0xFF // corrupt the stored checksum only
+
+	cases := []struct {
+		name     string
+		data     []byte
+		wantWarn bool
+	}{
+		{"corrupt checksum", broken, true},
+		{"healthy header", headed, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			inPath := filepath.Join(tempDir, "screen.scr")
+			if err := os.WriteFile(inPath, tc.data, 0644); err != nil {
+				t.Fatalf("write fixture failed: %v", err)
+			}
+			outPath := filepath.Join(tempDir, "screen.png")
+
+			var stderr bytes.Buffer
+			rootCmd.SetErr(&stderr)
+			defer rootCmd.SetErr(os.Stderr)
+			resetConvertFlags(t)
+			defer resetConvertFlags(t)
+
+			rootCmd.SetArgs([]string{"convert", "-i", inPath, "-o", outPath})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert failed: %v", err)
+			}
+			if _, serr := os.Stat(outPath); serr != nil {
+				t.Errorf("no PNG was written: %v", serr)
+			}
+
+			warned := strings.Contains(stderr.String(), "AMSDOS header")
+			if warned != tc.wantWarn {
+				t.Errorf("header warning = %v, want %v (stderr: %q)", warned, tc.wantWarn, stderr.String())
+			}
+			if tc.wantWarn && !strings.Contains(stderr.String(), "checksum") {
+				t.Errorf("warning does not name the checksum: %q", stderr.String())
+			}
+		})
+	}
+}
+
+// TestCLIPackKeepsZeroedPrefix verifies the same rule on the packing side: a
+// file whose first 128 bytes are zero is compressed as it is — those bytes are
+// data, not a header — with a warning, while the same screen behind a real
+// header is stripped and compressed as picture data only.
+func TestCLIPackKeepsZeroedPrefix(t *testing.T) {
+	payload := mkRawSCR(cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines))
+	zeroed := append(make([]byte, 128), payload...)
+	headed := amsdosWrap(t, payload, 0xC000)
+
+	cases := []struct {
+		name     string
+		data     []byte
+		want     []byte
+		wantWarn bool
+	}{
+		{"zeroed prefix", zeroed, zeroed, true},
+		{"real header", headed, payload, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			inPath := filepath.Join(tempDir, "input.bin")
+			if err := os.WriteFile(inPath, tc.data, 0644); err != nil {
+				t.Fatalf("write fixture failed: %v", err)
+			}
+			outPath := filepath.Join(tempDir, "out.zx0")
+
+			var stderr bytes.Buffer
+			rootCmd.SetErr(&stderr)
+			defer rootCmd.SetErr(os.Stderr)
+
+			rootCmd.SetArgs([]string{"pack", "-i", inPath, "-o", outPath, "--method", "zx0"})
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("pack failed: %v", err)
+			}
+
+			want := make([]byte, len(tc.want)*2+1024)
+			n, err := compress.NewCompressor().Pack(tc.want, len(tc.want), want, 0, compress.MethodZX0)
+			if err != nil {
+				t.Fatalf("reference Pack failed: %v", err)
+			}
+			if got := mustRead(t, outPath); !bytes.Equal(got, want[:n]) {
+				t.Errorf("packed payload is not the compression of the expected %d bytes", len(tc.want))
+			}
+
+			warned := strings.Contains(stderr.String(), "zeroed AMSDOS header")
+			if warned != tc.wantWarn {
+				t.Errorf("zeroed-prefix warning = %v, want %v (stderr: %q)", warned, tc.wantWarn, stderr.String())
+			}
+		})
+	}
+}

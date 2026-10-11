@@ -35,8 +35,13 @@ The geometry comes from the payload size and the whole payload is rendered: a
 16336-byte dump is a standard 80x200 screen, a 15872-byte one an underscan
 64x192 screen, and a 31936-byte one an **overscan** 96x272 screen (mode byte and
 palette at `&600`) whose lines past 255 live in the second half of the file. A
-payload of none of those sizes is refused with a **non-zero exit** and nothing
-written, rather than guessed as a standard screen.
+leading AMSDOS header is stripped with the same rule `pack` uses — its fields
+first, its checksum for confirmation — and a header with a problem is reported on
+stderr before the file is read as it is. A payload of none of those sizes is
+refused with a **non-zero exit** and nothing written, rather than guessed as a
+standard screen: that is also what a file of zeros gets, whose first 128 bytes
+used to pass for a header (0 sums to a stored 0) and which used to render as a
+320x200 or 256x192 screen.
 
 The PNG is emitted at the screen's own resolution, not at the renderer's 640-dot
 canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 /
@@ -191,12 +196,20 @@ usable one, a warning is printed and the packed file keeps an empty palette.
 **Compressing the screen, not the header:** every method — the whole PKS family
 included — strips a leading AMSDOS header first, so the packed stream holds
 exactly the payload a CPC decompressor writes back to memory (128 bytes less, and
-no shift in the picture). The header is recognised by its checksum or — when that
-checksum is not one this tool validates — by its fields: binary file type, a
-length that matches the file, a screen load address (`&C000` or `&0200`) and a
-payload of a screen size. A file that is not screen-shaped is compressed as it
-is, header included. The reported ratio is measured against the compressed
-payload, and `-v` says when a header was stripped.
+no shift in the picture). A header is recognised by its **fields**: a printable
+8.3 name, a file type of 0, 1 or 2, and a checksum that matches. The name is what
+tells a header from whatever bytes happen to start a file — 128 zero bytes
+satisfy a checksum comparison (0 sums to a stored 0) but have no name, which is
+how a zeroed prefix used to lose its first 128 bytes to a "header" and render a
+screen sized around them. For a **screen**, a header whose checksum a writer got
+wrong is still accepted on its fields (binary file type, a length that matches the
+file, a screen load address `&C000`/`&0200`, a payload of a screen size), because
+refusing those would compress the header as picture data. A file that is not
+screen-shaped is compressed as it is, header included. Either way the reading is
+made visible: a zeroed prefix or a header with a field problem is reported on
+stderr and the file is read as it is, while arbitrary data — a prefix with no
+name-shaped text — stays silent. The reported ratio is measured against the
+compressed payload, and `-v` says when a header was stripped.
 
 **Rejecting already-compressed input:** `pack` refuses to re-compress data that
 is already compressed and exits with a **non-zero code** so scripts can react.

@@ -34,6 +34,16 @@
   `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
   the packed and raw forms of a screen give identical PNGs; a variant the PKS
   engine does not implement fails with a non-zero exit and writes nothing
+- **AMSDOS header rule (shared with `pack`):** a 128-byte prefix is taken for a
+  header when its *fields* say so — a printable 8.3 name, a file type of 0, 1 or 2
+  — and its checksum confirms it. The name is the test that keeps arbitrary data
+  from being stripped, so a file of zeros (whose checksum trivially matches: 0
+  sums to a stored 0) is refused as an unknown payload size instead of being read
+  as a headed screen, as it used to be. A **screen** whose checksum a writer got
+  wrong is still read on its fields, with a warning on stderr naming the problem;
+  arbitrary data stays silent. `pkg/cpc` exposes the pieces
+  (`AmsdosFieldsPlausible`, `AmsdosNameReadable`, `AmsdosIssues`) so callers share
+  one definition of a plausible header.
 - **CPC modes:** 0, 1, 2 with proper validation
 - **Dithering methods:** All 11 methods from original (floyd-steinberg, bayer1-3, ordered1-3, zigzag1-3, none)
 - **Advanced options:**

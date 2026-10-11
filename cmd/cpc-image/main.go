@@ -409,14 +409,16 @@ func runConvert(cmd *cobra.Command, args []string) error {
 
 // screenAmsdosPayload reports whether data starts with an AMSDOS header that
 // describes a whole screen and, when it does, returns the payload that follows
-// it together with the declared load address. Headers whose checksum this
-// package does not validate are accepted as well, as long as their fields
-// describe a screen: some writers produce a checksum CheckAmsdos rejects, and
-// refusing those would compress the header as if it were picture data. A file
-// that is not a screen is left alone, so pack never drops a header it should
-// keep.
+// it together with the declared load address. The prefix has to look like a
+// header first — a name and a file type, see cpc.AmsdosFieldsPlausible — so a
+// run of bytes that merely passes a checksum comparison (128 zero bytes sum to
+// a stored 0) is never taken for one. Headers whose checksum this package does
+// not validate are still accepted on their fields, as long as those describe a
+// screen: some writers produce a checksum CheckAmsdos rejects, and refusing
+// those would compress the header as if it were picture data. A file that is
+// not a screen is left alone, so pack never drops a header it should keep.
 func screenAmsdosPayload(data []byte) ([]byte, uint16, bool) {
-	if len(data) < 128 {
+	if len(data) < 128 || !cpc.AmsdosFieldsPlausible(data) {
 		return nil, 0, false
 	}
 
@@ -442,6 +444,32 @@ func screenAmsdosPayload(data []byte) ([]byte, uint16, bool) {
 		return nil, 0, false
 	}
 	return data[128:], ent.Address, true
+}
+
+// amsdosNote says what is wrong with the 128-byte prefix of data when that
+// prefix claims to be an AMSDOS header, and returns "" when there is nothing
+// worth saying. It never changes how the file is read: a header whose checksum
+// or whose fields do not hold up is a warning, not an error — writers do get a
+// field wrong, and the lenient screen path accepts those — it only makes the
+// reading visible. Arbitrary data stays silent: a prefix whose name field is
+// not text is not a header attempt, and packing a plain binary must not nag,
+// while a zeroed prefix is reported, because that is the case this tool used to
+// read as headed and lose its first 128 bytes to.
+func amsdosNote(data []byte) string {
+	if len(data) < 128 {
+		return ""
+	}
+	if !anyNonZero(data[:128]) {
+		return "Warning: the 128-byte prefix is a zeroed AMSDOS header; reading the file as it is"
+	}
+	if !cpc.AmsdosNameReadable(data) {
+		return ""
+	}
+	issues := cpc.AmsdosIssues(data, len(data)-128)
+	if len(issues) == 0 {
+		return ""
+	}
+	return "Warning: AMSDOS header: " + strings.Join(issues, "; ")
 }
 
 // runPack handles the pack command
@@ -476,6 +504,9 @@ func runPack(cmd *cobra.Command, args []string) error {
 	inputData, err := os.ReadFile(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
+	}
+	if note := amsdosNote(inputData); note != "" {
+		fmt.Fprintln(cmd.ErrOrStderr(), note)
 	}
 
 	inputSize := len(inputData)
@@ -740,6 +771,9 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 	inputData, err := os.ReadFile(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
+	}
+	if note := amsdosNote(inputData); note != "" {
+		fmt.Fprintln(cmd.ErrOrStderr(), note)
 	}
 
 	inputSize := len(inputData)
@@ -1588,10 +1622,17 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 	if err != nil {
 		return fmt.Errorf("failed to read input file: %w", err)
 	}
+	if note := amsdosNote(data); note != "" {
+		fmt.Fprintln(warn, note)
+	}
 
+	// An AMSDOS header is stripped when the file carries one this tool can make
+	// sense of, the same reading `pack` uses: a header that validates, or one
+	// whose fields describe a whole screen even though its checksum does not.
 	payload := data
-	if len(data) >= 128 && cpc.CheckAmsdos(data) {
-		payload = data[128:]
+	addr := uint16(0)
+	if p, a, ok := screenAmsdosPayload(data); ok {
+		payload, addr = p, a
 	}
 
 	// A PKS-compressed screen is unpacked first: its payload is a compressed
@@ -1645,14 +1686,8 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 	// palette at ModePalOffset, overscan dumps carry them at 0x600 instead — the
 	// slot fileio.SaveSCR writes them to. The geometry identifies an overscan
 	// dump, and the AMSDOS load address (&0200) corroborates it when the header
-	// validates.
+	// described one.
 	modeOffset := cpc.ModePalOffset
-	addr := uint16(0)
-	if len(data) >= 128 && cpc.CheckAmsdos(data) {
-		if ent, e := cpc.GetAmsdos(data); e == nil {
-			addr = ent.Address
-		}
-	}
 	if numCol == cpc.OverscanCols || addr == 0x0200 {
 		modeOffset = cpc.OverscanModePalOffset
 	}
