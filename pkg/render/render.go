@@ -116,7 +116,7 @@ func (b *BitmapCpc) EncodeToCpc(bmpLock *bitmap.DirectBitmap, egx bool, ligneSta
 
 	// Process each scanline pair
 	for y := 0; y < height; y += 2 {
-		cpcAddr := cpc.CpcAddress(y, b.NumCol, b.NumLig)
+		cpcAddr := cpc.CpcAddress(y>>1, b.NumCol, b.NumLig)
 		tx := cpc.PixelWidth(b.VirtualMode, y, 0)
 
 		// Process each byte (8 pixels)
@@ -154,7 +154,7 @@ func (b *BitmapCpc) EncodeToCpcForceMode1(bmpLock *bitmap.DirectBitmap) {
 	height := b.NumLig << 1
 
 	for y := 0; y < height; y += 2 {
-		cpcAddr := cpc.CpcAddress(y, b.NumCol, b.NumLig)
+		cpcAddr := cpc.CpcAddress(y>>1, b.NumCol, b.NumLig)
 		tx := cpc.PixelWidth(b.VirtualMode, y, 0)
 		maxPen := cpc.MaxPen(b.VirtualMode, y, 0)
 
@@ -225,7 +225,7 @@ func (b *BitmapCpc) DrawBitmap(numCol, numLig int, realWidth int, isSprite bool)
 		if isSprite {
 			cpcAddr = numCol * (y >> 1)
 		} else {
-			cpcAddr = cpc.CpcAddress(y, numCol, numLig)
+			cpcAddr = cpc.CpcAddress(y>>1, numCol, numLig)
 		}
 
 		xBitmap := 0

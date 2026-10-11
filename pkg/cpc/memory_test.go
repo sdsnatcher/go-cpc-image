@@ -6,100 +6,111 @@ import (
 	"testing"
 )
 
-// TestCpcAddress tests CPC screen memory address calculation with known values
+// TestCpcAddress tests CPC screen memory address calculation with known values.
+// The argument is a CRTC line: eight lines make a character row, and each line
+// of that row starts a further 0x800 bytes into the dump.
 func TestCpcAddress(t *testing.T) {
-	// Test standard screen addressing (80 cols x 200 lines at #C000)
-	// Formula: adr = (y/16)*numCol + (y%16)*#400
 	tests := []struct {
 		name   string
-		y      int
+		line   int
 		numCol int
 		numLig int
 		expect int
 	}{
 		// Standard screen (80 cols x 200 lines)
 		{"Standard line 0", 0, 80, 200, 0x0000},
-		{"Standard line 2", 2, 80, 200, 0x0800},
-		{"Standard line 16", 16, 80, 200, 0x0050},
-		{"Standard line 18", 18, 80, 200, 0x0850},
-		{"Standard line 32", 32, 80, 200, 0x00A0},
-		{"Standard line 64", 64, 80, 200, 0x0140},
-		{"Standard line 128", 128, 80, 200, 0x0280},
-		{"Standard line 160", 160, 80, 200, 0x0320},
+		{"Standard line 1", 1, 80, 200, 0x0800},
+		{"Standard line 8", 8, 80, 200, 0x0050},
+		{"Standard line 9", 9, 80, 200, 0x0850},
+		{"Standard line 16", 16, 80, 200, 0x00A0},
+		{"Standard line 32", 32, 80, 200, 0x0140},
+		{"Standard line 64", 64, 80, 200, 0x0280},
+		{"Standard line 80", 80, 80, 200, 0x0320},
 
-		// Overscan screen (96 cols x 272 lines at #0200)
+		// Overscan screen (96 cols x 272 lines at #0200); its dump passes 16 KB,
+		// so line 128 and later take the #3800 wrap.
 		{"Overscan line 0", 0, 96, 272, 0x0000},
-		{"Overscan line 2", 2, 96, 272, 0x0800},
-		{"Overscan line 16", 16, 96, 272, 0x0060},
-		{"Overscan line 256", 256, 96, 272, 0x3E00},
-		{"Overscan line 258", 258, 96, 272, 0x4600}, // y>255: adds 0x3800
-		{"Overscan line 270", 270, 96, 272, 0x7600},
+		{"Overscan line 1", 1, 96, 272, 0x0800},
+		{"Overscan line 8", 8, 96, 272, 0x0060},
+		{"Overscan line 128", 128, 96, 272, 0x3E00},
+		{"Overscan line 129", 129, 96, 272, 0x4600},
+		{"Overscan line 135", 135, 96, 272, 0x7600},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := CpcAddress(tt.y, tt.numCol, tt.numLig)
+			got := CpcAddress(tt.line, tt.numCol, tt.numLig)
 			if got != tt.expect {
 				t.Errorf("CpcAddress(%d, %d, %d) = 0x%04X, want 0x%04X",
-					tt.y, tt.numCol, tt.numLig, got, tt.expect)
+					tt.line, tt.numCol, tt.numLig, got, tt.expect)
 			}
 		})
 	}
 }
 
-// TestCpcAddressInterleaving tests the interleaved addressing pattern
-func TestCpcAddressInterleaving(t *testing.T) {
-	// CPC screen memory is interleaved: lines 0,8,16,24... are consecutive,
-	// then lines 2,10,18,26..., then 4,12,20,28..., etc.
-	// This tests that the interleaving formula is correct.
-
-	numCol := 80
-	numLig := 200
-
-	// Test that consecutive even lines are 0x800 apart (within same group)
-	for y := 0; y < 14; y += 2 {
-		addr0 := CpcAddress(y, numCol, numLig)
-		addr1 := CpcAddress(y+2, numCol, numLig)
-		diff := addr1 - addr0
-		if diff != 0x800 {
-			t.Errorf("Address difference between line %d and %d = 0x%04X, want 0x800", y, y+2, diff)
+// TestCpcAddressTakesCrtcLines pins the contract of CpcAddress: its argument is
+// a CRTC line, not the pixel row of the doubled canvas the pipeline still
+// stores. The two agree wherever the canvas samples a line — even pixel rows,
+// which is where every caller reads it — so this was a renaming of the
+// convention, not a move of any address.
+func TestCpcAddressTakesCrtcLines(t *testing.T) {
+	for _, s := range []struct{ numCol, numLig int }{{80, 200}, {96, 272}, {64, 192}} {
+		for line := 0; line < s.numLig; line++ {
+			row := line << 1 // the canvas stores each line as two pixel rows
+			canvas := (row>>4)*s.numCol + (row&14)*0x400
+			if row > 255 && s.numCol*s.numLig > 0x4000 {
+				canvas += 0x3800
+			}
+			if got := CpcAddress(line, s.numCol, s.numLig); got != canvas {
+				t.Fatalf("CpcAddress(%d, %d, %d) = 0x%04X, want the canvas value 0x%04X",
+					line, s.numCol, s.numLig, got, canvas)
+			}
 		}
-	}
-
-	// Test that line 16 follows line 0 with +numCol offset
-	addr0 := CpcAddress(0, numCol, numLig)
-	addr16 := CpcAddress(16, numCol, numLig)
-	diff := addr16 - addr0
-	if diff != numCol {
-		t.Errorf("Address difference between line 0 and 16 = 0x%04X, want 0x%04X", diff, numCol)
 	}
 }
 
-// TestCpcAddressOverscanOffset tests the 0x3800 offset for y>255 in overscan
+// TestCpcAddressInterleaving pins the two strides of the layout: consecutive
+// lines of a character row are 0x800 apart, and the next character row starts
+// numCol bytes after the first line of the previous one.
+func TestCpcAddressInterleaving(t *testing.T) {
+	numCol := 80
+	numLig := 200
+
+	for line := 0; line < 7; line++ {
+		addr0 := CpcAddress(line, numCol, numLig)
+		addr1 := CpcAddress(line+1, numCol, numLig)
+		if diff := addr1 - addr0; diff != 0x800 {
+			t.Errorf("Address difference between line %d and %d = 0x%04X, want 0x800", line, line+1, diff)
+		}
+	}
+
+	addr0 := CpcAddress(0, numCol, numLig)
+	addr8 := CpcAddress(8, numCol, numLig)
+	if diff := addr8 - addr0; diff != numCol {
+		t.Errorf("Address difference between line 0 and 8 = 0x%04X, want 0x%04X", diff, numCol)
+	}
+}
+
+// TestCpcAddressOverscanOffset pins the #3800 offset an overscan dump takes
+// past line 127, and that nothing before it — and no smaller screen — ever does.
 func TestCpcAddressOverscanOffset(t *testing.T) {
 	numCol := 96
 	numLig := 272
 
-	// Lines 254 and 256 should have a larger gap due to the 0x3800 offset
-	addr254 := CpcAddress(254, numCol, numLig)
-	addr256 := CpcAddress(256, numCol, numLig)
-
-	// Without the offset, the difference would be (256-254)/16*numCol + ((256&14)-(254&14))*0x400
-	// With offset: addr256 should have +0x3800
-	expectedDiff := (256>>4)*numCol + ((256 & 14) * 0x400) + 0x3800 - addr254
-
-	diff := addr256 - addr254
-	if diff != expectedDiff {
-		t.Logf("addr254=0x%04X, addr256=0x%04X", addr254, addr256)
-		t.Errorf("Address jump from line 254 to 256 = 0x%04X, want 0x%04X", diff, expectedDiff)
+	if got, want := CpcAddress(128, numCol, numLig), 16*numCol+0x3800; got != want {
+		t.Errorf("CpcAddress(128, 96, 272) = 0x%04X, want 0x%04X", got, want)
 	}
 
-	// Verify that the offset is exactly 0x3800 more than it would be without the offset
-	addrWithoutOffset := (256>>4)*numCol + ((256 & 14) * 0x400)
-	addrWithOffset := addr256
-	offsetApplied := addrWithOffset - (addrWithoutOffset - addr254 + addr254)
-	if offsetApplied != 0x3800 {
-		t.Errorf("Overscan offset applied = 0x%04X, want 0x3800", offsetApplied)
+	for line := 0; line < 128; line++ {
+		plain := (line>>3)*numCol + (line&7)*0x800
+		if got := CpcAddress(line, numCol, numLig); got != plain {
+			t.Errorf("CpcAddress(%d, 96, 272) = 0x%04X, want 0x%04X (no wrap before line 128)", line, got, plain)
+		}
+	}
+
+	// An underscan dump is 12288 bytes: its lines pass 127 without wrapping.
+	if got, want := CpcAddress(128, 64, 192), 16*64; got != want {
+		t.Errorf("CpcAddress(128, 64, 192) = 0x%04X, want 0x%04X (a 12 KB dump does not wrap)", got, want)
 	}
 }
 
@@ -324,7 +335,7 @@ func TestColumnMajorGeometryRoundTrip(t *testing.T) {
 			}
 			for x := 0; x < tc.numCol; x++ {
 				for y := 0; y < tc.numLig; y++ {
-					adr := x + CpcAddress(y<<1, tc.numCol, tc.numLig)
+					adr := x + CpcAddress(y, tc.numCol, tc.numLig)
 					if scattered[adr] != bmp[adr] {
 						t.Fatalf("pixel (%d,%d) at %d = %d, want %d", x, y, adr, scattered[adr], bmp[adr])
 					}

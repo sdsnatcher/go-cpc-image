@@ -29,7 +29,7 @@ func mkRawSCR(size int) []byte {
 	raw := make([]byte, size)
 	for x := 0; x < cpc.StandardCols; x++ {
 		for y := 0; y < cpc.StandardLines; y++ {
-			adr := x + cpc.CpcAddress(y<<1, cpc.StandardCols, cpc.StandardLines)
+			adr := x + cpc.CpcAddress(y, cpc.StandardCols, cpc.StandardLines)
 			if adr < size {
 				raw[adr] = byte((x*13 + y*7) & 0xFF)
 			}
@@ -57,7 +57,7 @@ func syntheticSCR(numCol, numLig, mode int) []byte {
 	raw := make([]byte, cpc.BitmapSize(numCol, numLig))
 	for x := 0; x < numCol; x++ {
 		for y := 0; y < numLig; y++ {
-			adr := x + cpc.CpcAddress(y<<1, numCol, numLig)
+			adr := x + cpc.CpcAddress(y, numCol, numLig)
 			if adr < len(raw) {
 				raw[adr] = byte((x*13 + y*7) & 0xFF)
 			}
@@ -1468,7 +1468,7 @@ func TestCLIConvertOverscanSCRToPNG(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			payload := syntheticSCR(cpc.OverscanCols, cpc.OverscanLines, tc.mode)
-			payload[markerCol+cpc.CpcAddress(markerLine*2, cpc.OverscanCols, cpc.OverscanLines)] = 0x80
+			payload[markerCol+cpc.CpcAddress(markerLine, cpc.OverscanCols, cpc.OverscanLines)] = 0x80
 			if tc.headered {
 				payload = amsdosWrap(t, payload, 0x0200)
 			}

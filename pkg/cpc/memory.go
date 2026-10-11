@@ -1,23 +1,25 @@
 // Package cpc provides CPC memory layout and screen addressing.
 package cpc
 
-// CpcAddress calculates the CPC screen memory address for a given Y coordinate.
-// CPC screen memory uses interleaved addressing:
+// CpcAddress calculates the CPC screen memory address of a CRTC line. The
+// hardware walks the memory itself: eight lines make a character row, and each
+// line of that row starts a further 0x800 bytes into the dump.
 // - Standard: 80 cols x 200 lines at #C000
 // - Overscan: 96 cols x 272 lines at #0200
-// Address = (y/16)*numCol + (y%16)*#400, with +#3800 offset for y>255 in overscan
-func CpcAddress(y int, numCol int, numLig int) int {
-	addr := (y>>4)*numCol + (y&14)*0x400
-	if y > 255 && (numCol*numLig > 0x4000) {
+// Address = (line/8)*numCol + (line%8)*#800, with a #3800 offset past line 127
+// of an overscan screen, whose dump is more than 16 KB and therefore wraps.
+func CpcAddress(line int, numCol int, numLig int) int {
+	addr := (line>>3)*numCol + (line&7)*0x800
+	if line > 127 && (numCol*numLig > 0x4000) {
 		addr += 0x3800
 	}
 	return addr
 }
 
-// BitmapSize calculates the total size needed for CPC screen buffer.
+// BitmapSize calculates the total size needed for CPC screen buffer: the bytes
+// of the last line, plus the columns that precede it in its character row.
 func BitmapSize(numCol int, numLig int) int {
-	height := numLig << 1 // Convert lines to pixels (each line = 2 pixels high)
-	return numCol + CpcAddress((height&0x3F8)-2, numCol, numLig)
+	return numCol + CpcAddress(numLig-1, numCol, numLig)
 }
 
 // Screen geometry constants and functions
@@ -108,9 +110,9 @@ func (s *ScreenConfig) SetTailleY(pixels int) {
 	s.NumLig = pixels >> 1
 }
 
-// GetAdr calculates the CPC screen memory address for a given Y coordinate
-func (s ScreenConfig) GetAdr(y int) int {
-	return CpcAddress(y, s.NumCol, s.NumLig)
+// GetAdr returns the memory address of a CRTC line in this screen's layout
+func (s ScreenConfig) GetAdr(line int) int {
+	return CpcAddress(line, s.NumCol, s.NumLig)
 }
 
 // GetBitmapSize returns the total buffer size needed for this screen configuration
@@ -133,7 +135,7 @@ const UnderscanPixelBytes = UnderscanCols * UnderscanLines
 //
 //	for x := 0; x < numCol; x++ {
 //	  for y := 0; y < numLig; y++ {
-//	    out = append(out, bmp[x + CpcAddress(y*2, numCol, numLig)])
+//	    out = append(out, bmp[x + CpcAddress(y, numCol, numLig)])
 //	  }
 //	}
 //
@@ -143,7 +145,7 @@ func ScreenToColumnMajor(bmp []byte, numCol, numLig int) []byte {
 	i := 0
 	for x := 0; x < numCol; x++ {
 		for y := 0; y < numLig; y++ {
-			adr := x + CpcAddress(y<<1, numCol, numLig)
+			adr := x + CpcAddress(y, numCol, numLig)
 			if adr < len(bmp) {
 				out[i] = bmp[adr]
 			}
@@ -166,7 +168,7 @@ func ColumnMajorToScreen(data []byte, numCol, numLig int) []byte {
 			if i >= len(data) {
 				return out
 			}
-			adr := x + CpcAddress(y<<1, numCol, numLig)
+			adr := x + CpcAddress(y, numCol, numLig)
 			if adr < len(out) {
 				out[adr] = data[i]
 			}
