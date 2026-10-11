@@ -4,7 +4,7 @@
 
 ### Core CLI Structure
 - **Version reporting:** `internal/version` holds the single version string shared
-  by the CLI and the GUI; `--version` prints `convimgcpc version 1.2.1`, and the
+  by the CLI and the GUI; `--version` prints `convimgcpc version 1.3.0`, and the
   verbose banner and the GUI title label read the same constant
 - **Cobra-based CLI framework** with proper command structure
 - **Five main commands implemented:**
@@ -76,6 +76,10 @@
   64x192 underscan payload → `PKUL`/`PKU3`/`PKUP`; the `0x80` bit of the mode
   byte at `&17D0`/`&600` → `PKSP`/`PKVP`/`PKUP`; mode 3 with a valid ModePal →
   `PKS3`/`PKU3`; otherwise `PKSL`), and reports the choice in the summary
+- **PKS payload layouts:** the "L" variants (PKSL, PKUL) compress the picture
+  alone, in column-major order and with the screen's own geometry — 16000 bytes
+  for an 80x200 screen, 12288 for an underscan 64x192 one; every other variant
+  compresses the screen dump as it is, gaps and palette block included
 - **AMSDOS header stripping:** every method (the PKS family included) compresses
   the screen payload only, never the 128-byte header; a header whose checksum is
   not the one this tool validates is still recognised from its fields (binary
@@ -91,8 +95,12 @@
   pksp, pkvl, pkvp, pkul, pku3, pkup)
 - **Auto-detection** from file header when `--method` is omitted (`PK` → pks;
   MJH → ocp; otherwise lzw)
-- **PKSL round-trip:** the column-major payload is scattered back into the CPC
-  screen layout and the embedded ModePal re-written at `&17D0`
+- **PKSL/PKUL round-trip:** the column-major payload is scattered back with the
+  geometry its length names — 16000 bytes for a standard 80x200 screen, 12288 for
+  an underscan 64x192 one — and the embedded ModePal is re-written at `&17D0`. A
+  `PKUL` payload of 16000 bytes, the underscan image padded inside the standard
+  frame this tool wrote before 1.3.0, is refused with a message that says to
+  re-pack the raw screen
 - **Rejects raw (uncompressed) SCR input** in auto-detect with a non-zero exit
 - **Rejects unrecognized data**: LZW output that is not a recognized CPC screen
   size (16336 / 31936 / 16000 bytes) is treated as corrupt

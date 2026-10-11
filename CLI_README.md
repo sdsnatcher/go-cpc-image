@@ -14,7 +14,7 @@ This creates the `cpc-image` executable in the project root.
 
 ## Global flags
 
-- `--version` - print the release version (`convimgcpc version 1.2.1`) and exit
+- `--version` - print the release version (`convimgcpc version 1.3.0`) and exit
 - `-v, --verbose` - print a banner naming the version and the details of every step
 
 ## Commands
@@ -193,6 +193,12 @@ one, and a `.kit` is also recognised by its size, so a misnamed file still loads
 When a variant needs a palette and neither the screen nor `--palette` provides a
 usable one, a warning is printed and the packed file keeps an empty palette.
 
+**PKS payload layouts:** the `L` variants (`PKSL`, `PKUL`) compress the picture
+alone, in column-major order and with the screen's own geometry — 16000 bytes for
+an 80x200 screen, 12288 for an underscan 64x192 one. Every other variant (`PKS3`,
+`PKSP`, `PKVL`, `PKVP`, `PKU3`, `PKUP`) compresses the screen dump as it is, its
+layout gaps and palette block included.
+
 **Compressing the screen, not the header:** every method — the whole PKS family
 included — strips a leading AMSDOS header first, so the packed stream holds
 exactly the payload a CPC decompressor writes back to memory (128 bytes less, and
@@ -240,12 +246,16 @@ cpc-image unpack -i screen.pks -o screen.scr
 ```
 
 **PKS family (`PK` payloads):** decompressed transparently, whichever variant
-the signature names. For `PKSL` and `PKUL` the payload is column-major pixel
-data: it is scattered back into the CPC screen layout and the embedded ModePal is
-re-written at `&17D0`, so the restored `.SCR` is self-describing, like the
-original screens — `PKUL` screens end at `&3E00` bytes (64x192) instead of the
-standard `&3FD0`. `PKVL` / `PKVP` (overscan) and the other variants emit the
-payload as it is.
+the signature names. For `PKSL` and `PKUL` the payload is column-major pixel data
+extracted with the screen's own geometry — 16000 bytes for a standard 80x200
+screen, 12288 for an underscan 64x192 one — so it is scattered back with that
+geometry and the embedded ModePal is re-written at `&17D0`, making the restored
+`.SCR` self-describing (`&3FD0` bytes for a standard screen, `&3E00` for an
+underscan one). `PKVL` / `PKVP` (overscan) and the other variants emit the payload
+as it is. A `PKUL` payload of 16000 bytes — an underscan image padded inside the
+standard frame, the layout this tool wrote before 1.3.0 — is **refused** with a
+message that names it; re-pack the screen from its raw `.SCR` to get the 64x192
+payload.
 
 **Rejecting raw (uncompressed) SCR input:** in auto-detect mode, `unpack` refuses
 to operate on a raw (already-uncompressed) CPC screen dump: a valid AMSDOS header

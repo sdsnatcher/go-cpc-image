@@ -1121,12 +1121,29 @@ func TestCLIPackUnderscanVariantsRoundTrip(t *testing.T) {
 			if err := rootCmd.Execute(); err != nil {
 				t.Fatalf("pack failed: %v", err)
 			}
-			header, err := compress.ParsePKSHeader(mustRead(t, packedPath)[128:])
+			packedData := mustRead(t, packedPath)
+			header, err := compress.ParsePKSHeader(packedData[128:])
 			if err != nil {
 				t.Fatalf("ParsePKSHeader failed: %v", err)
 			}
 			if header.Variant != tc.variant {
 				t.Errorf("variant = %s, want %s", pksVariantName(header.Variant), pksVariantName(tc.variant))
+			}
+
+			// What the payload holds: the "L" flavour packs the picture alone in
+			// the screen's own geometry (12288 bytes for a 64x192 screen), the
+			// dump-carrying variants pack the 15872-byte underscan dump.
+			payload := make([]byte, 0x20000)
+			payloadLen, _, derr := compress.NewCompressor().PKS().DepackPKS(packedData[128:], payload)
+			if derr != nil {
+				t.Fatalf("DepackPKS failed: %v", derr)
+			}
+			wantPayload := underscanSize
+			if tc.variant == compress.PKUL {
+				wantPayload = cpc.UnderscanPixelBytes
+			}
+			if payloadLen != wantPayload {
+				t.Errorf("payload = %d bytes, want %d", payloadLen, wantPayload)
 			}
 
 			rootCmd.SetArgs([]string{"unpack", "-i", packedPath, "-o", unpackedPath})
@@ -1139,9 +1156,14 @@ func TestCLIPackUnderscanVariantsRoundTrip(t *testing.T) {
 			}
 
 			if tc.variant == compress.PKUL {
-				// Pixel data only survives, compared in the payload layout.
-				if !bytes.Equal(cpc.ScreenToColumnMajor(restored, cpc.StandardCols, cpc.StandardLines),
-					cpc.ScreenToColumnMajor(screen, cpc.StandardCols, cpc.StandardLines)) {
+				// The payload is the 64x192 picture in column-major order, and
+				// the restored dump holds it back in the CPC screen layout.
+				if !bytes.Equal(payload[:payloadLen],
+					cpc.ScreenToColumnMajor(screen, cpc.UnderscanCols, cpc.UnderscanLines)) {
+					t.Error("PKUL payload is not the 64x192 picture in column-major order")
+				}
+				if !bytes.Equal(cpc.ScreenToColumnMajor(restored, cpc.UnderscanCols, cpc.UnderscanLines),
+					payload[:payloadLen]) {
 					t.Error("PKUL pixel data mismatch after round-trip")
 				}
 				got := restored[cpc.ModePalOffset : cpc.ModePalOffset+17]
@@ -1552,11 +1574,12 @@ func TestCLIConvertRejectsUnknownSCRSize(t *testing.T) {
 	}
 }
 
-// TestCLIUnpackRealPKULSamples unpacks every underscan PKUL sample that has a
-// paired raw screen and checks the restored dump: the underscan size, the pixel
-// data in the payload's column-major layout and the ModePal taken from the
-// header. The layout gaps are not compared: the raw screens keep their display
-// code there, while a restored dump has its gaps zeroed.
+// TestCLIUnpackRealPKULSamples works on the real underscan samples that have a
+// raw screen next to them. Every packed file in that corpus predates the payload
+// fix — it holds an underscan image padded inside the standard 80x200 frame —
+// so it is refused with a message that names the retired layout and says to
+// re-pack, and packing the raw screen yields the 12288-byte 64x192 payload that
+// restores the same pixels. Nothing is written for a refused payload.
 func TestCLIUnpackRealPKULSamples(t *testing.T) {
 	root := os.Getenv(corpusSamplesEnv)
 	if root == "" {
@@ -1582,28 +1605,66 @@ func TestCLIUnpackRealPKULSamples(t *testing.T) {
 		if string(packedData[128:132]) != "PKUL" {
 			t.Fatalf("%s: signature = %q, want PKUL", name, packedData[128:132])
 		}
-		header, herr := compress.ParsePKSHeader(packedData[128:])
-		if herr != nil {
-			t.Fatalf("%s: ParsePKSHeader failed: %v", name, herr)
+
+		// (1) The retired frame payload is refused, with the reason and with
+		// nothing written.
+		outPath := filepath.Join(t.TempDir(), name)
+		rootCmd.SetArgs([]string{"unpack", "-i", pk, "-o", outPath})
+		unpackErr := rootCmd.Execute()
+		if unpackErr == nil {
+			t.Fatalf("%s: the retired 80x200-frame payload was accepted", name)
 		}
+		if !strings.Contains(unpackErr.Error(), "no longer writes") {
+			t.Errorf("%s: refusal does not explain the retired layout: %v", name, unpackErr)
+		}
+		if _, serr := os.Stat(outPath); serr == nil {
+			t.Errorf("%s: a file was written for a refused payload", name)
+		}
+
+		// (2) Re-packing the raw screen gives the 64x192 payload (12288 bytes),
+		// and unpacking that restores the raw screen's pixels and the palette the
+		// header carries.
 		rawData := mustRead(t, rawPath)
 		rawPayload := rawData
 		if len(rawData) >= 128 && cpc.CheckAmsdos(rawData) {
 			rawPayload = rawData[128:]
 		}
 
-		outPath := filepath.Join(t.TempDir(), name)
-		rootCmd.SetArgs([]string{"unpack", "-i", pk, "-o", outPath})
+		repackedPath := filepath.Join(t.TempDir(), name)
+		rootCmd.SetArgs([]string{"pack", "-i", rawPath, "-o", repackedPath, "--method", "pkul"})
 		if err := rootCmd.Execute(); err != nil {
-			t.Fatalf("%s: unpack failed: %v", name, err)
+			t.Fatalf("%s: re-pack failed: %v", name, err)
 		}
-		restored := mustRead(t, outPath)
+		repacked := mustRead(t, repackedPath)
+		header, herr := compress.ParsePKSHeader(repacked[128:])
+		if herr != nil {
+			t.Fatalf("%s: ParsePKSHeader failed on the re-packed file: %v", name, herr)
+		}
+		payload := make([]byte, 0x20000)
+		payloadLen, _, derr := compress.NewCompressor().PKS().DepackPKS(repacked[128:], payload)
+		if derr != nil {
+			t.Fatalf("%s: DepackPKS failed: %v", name, derr)
+		}
+		if payloadLen != cpc.UnderscanPixelBytes {
+			t.Fatalf("%s: re-packed payload = %d bytes, want %d (64x192)", name, payloadLen, cpc.UnderscanPixelBytes)
+		}
+		if !bytes.Equal(payload[:payloadLen],
+			cpc.ScreenToColumnMajor(rawPayload, cpc.UnderscanCols, cpc.UnderscanLines)) {
+			t.Errorf("%s: the payload is not the raw screen's 64x192 picture in column-major order", name)
+		}
+
+		restoredPath := filepath.Join(t.TempDir(), name)
+		rootCmd.SetArgs([]string{"unpack", "-i", repackedPath, "-o", restoredPath})
+		if err := rootCmd.Execute(); err != nil {
+			t.Fatalf("%s: unpack of the re-packed screen failed: %v", name, err)
+		}
+		restored := mustRead(t, restoredPath)
 		if wantSize := cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines); len(restored) != wantSize {
 			t.Fatalf("%s: restored %d bytes, want %d", name, len(restored), wantSize)
 		}
 		if !bytes.Equal(
-			cpc.ScreenToColumnMajor(restored, cpc.StandardCols, cpc.StandardLines),
-			cpc.ScreenToColumnMajor(rawPayload, cpc.StandardCols, cpc.StandardLines)) {
+			cpc.ScreenToColumnMajor(restored, cpc.UnderscanCols, cpc.UnderscanLines),
+			cpc.ScreenToColumnMajor(rawPayload, cpc.UnderscanCols, cpc.UnderscanLines)) {
 			t.Errorf("%s: pixel data differs from the raw screen", name)
 		}
 		got := restored[cpc.ModePalOffset : cpc.ModePalOffset+17]
@@ -2911,7 +2972,7 @@ func TestCLIUnpackRejectsRenderedOutputFormats(t *testing.T) {
 
 // TestCLIVersionFlag verifies that --version reports the release being built.
 // The flag went missing during the import from the 1.2.0-pks tree, and the
-// string it reports must name this release (1.2.1), not the unofficial -pks
+// string it reports must name this release (1.3.0), not the unofficial -pks
 // build it replaced; the verbose banner carries the same string.
 func TestCLIVersionFlag(t *testing.T) {
 	var out bytes.Buffer
@@ -2927,8 +2988,8 @@ func TestCLIVersionFlag(t *testing.T) {
 	if got := strings.TrimSpace(out.String()); got != want {
 		t.Errorf("--version printed %q, want %q", got, want)
 	}
-	if version.Version != "1.2.1" {
-		t.Errorf("version = %q, want the released 1.2.1", version.Version)
+	if version.Version != "1.3.0" {
+		t.Errorf("version = %q, want the released 1.3.0", version.Version)
 	}
 	// -v stays the verbose shorthand: cobra drops the -v alias for --version
 	// when the shorthand is taken, and a silent `-v` (no banner) would mean the

@@ -674,17 +674,17 @@ func runPack(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// The PKSL payload is column-major pixel data (16000 bytes); the other
-		// variants compress the screen dump as it is.
-		// The column-major variants (PKSL, PKUL) store pixel data only; both use
-		// the standard 80x200 column-major layout, the underscan image sitting
-		// inside that frame.
+		// The "L" variants (PKSL, PKUL) store column-major pixel data extracted
+		// with the screen's own geometry — 16000 bytes for a standard 80x200
+		// screen, 12288 for an underscan 64x192 one — while every other variant
+		// compresses the screen dump as it is.
 		packInput := bitmap
 		if len(plusBlock) == 33 {
 			packInput = cpc.EmbedModePalAt(bitmap, plusModePalOffset(overscan), plusBlock)
 		}
-		if _, columnMajor := pksColumnMajorPayload(variant); columnMajor {
-			packInput = cpc.ScreenToColumnMajor(packInput, cpc.StandardCols, cpc.StandardLines)
+		if pksColumnMajorPayload(variant) {
+			cols, lines := pksColumnMajorScreen(variant)
+			packInput = cpc.ScreenToColumnMajor(packInput, cols, lines)
 		}
 		packedInputSize = len(packInput)
 
@@ -877,23 +877,27 @@ func runUnpack(cmd *cobra.Command, args []string) error {
 				pksVariantName(header.Variant), header.CpcPlus, header.Overscan)
 		}
 		// A column-major variant (PKSL/PKUL) stores pixel data only: scatter it
-		// back into the standard CPC screen layout, keep the dump size of the
-		// variant's geometry (underscan screens end at 15872 bytes) and re-embed
-		// the ModePal, so the restored .SCR is self-describing as the original
-		// screens are. The other variants carry the screen dump as it is.
+		// back with the geometry its length names (80x200 or 64x192), keep the
+		// dump size of that geometry (underscan screens end at 15872 bytes) and
+		// re-embed the ModePal, so the restored .SCR is self-describing as the
+		// original screens are. The other variants carry the screen dump as it is.
 		if header != nil {
-			if screenSize, columnMajor := pksColumnMajorPayload(header.Variant); columnMajor {
-				screen := cpc.ColumnMajorToScreen(depacked[:outputSize], cpc.StandardCols, cpc.StandardLines)
-				if screenSize < len(screen) {
-					screen = screen[:screenSize]
+			if !pksColumnMajorPayload(header.Variant) {
+				outputBuffer = depacked
+			} else {
+				numCol, numLig, geoErr := pksColumnMajorGeometry(header.Variant, outputSize)
+				if geoErr != nil {
+					return geoErr
+				}
+				screen := cpc.ColumnMajorToScreen(depacked[:outputSize], numCol, numLig)
+				if size := cpc.BitmapSize(numCol, numLig); size < len(screen) {
+					screen = screen[:size]
 				}
 				if anyNonZero(header.Palette[:]) {
 					screen = cpc.EmbedModePal(screen, header.Palette[:])
 				}
 				outputBuffer = screen
 				outputSize = len(screen)
-			} else {
-				outputBuffer = depacked
 			}
 		}
 
@@ -1107,19 +1111,40 @@ func pksVariantEmbedsModePal(variant compress.PKSVariant) bool {
 }
 
 // pksColumnMajorPayload reports whether a variant stores its payload as
-// column-major pixel data and, when it does, the size of the screen dump it
-// restores. The payload itself always uses the standard 80x200 layout: the
-// reference underscan files (PKUL) pack that way, with the underscan image
-// inside the standard pixel frame. The restored screen keeps the variant's own
-// geometry, i.e. 15872 bytes for underscan instead of 16336.
-func pksColumnMajorPayload(variant compress.PKSVariant) (screenSize int, columnMajor bool) {
-	switch variant {
-	case compress.PKSL:
-		return cpc.BitmapSize(cpc.StandardCols, cpc.StandardLines), true
-	case compress.PKUL:
-		return cpc.BitmapSize(cpc.UnderscanCols, cpc.UnderscanLines), true
+// column-major pixel data instead of a screen dump. Only the "L" flavours do
+// (PKSL, PKUL); every other variant compresses the dump as it is, which is also
+// why only those two have a palette field in their header.
+func pksColumnMajorPayload(variant compress.PKSVariant) bool {
+	return variant == compress.PKSL || variant == compress.PKUL
+}
+
+// pksColumnMajorScreen returns the geometry a column-major payload is extracted
+// from and scattered back into: the screen's own. A standard 80x200 screen gives
+// 16000 bytes, an underscan 64x192 one 12288.
+func pksColumnMajorScreen(variant compress.PKSVariant) (numCol, numLig int) {
+	if variant == compress.PKUL {
+		return cpc.UnderscanCols, cpc.UnderscanLines
 	}
-	return 0, false
+	return cpc.StandardCols, cpc.StandardLines
+}
+
+// pksColumnMajorGeometry validates a depacked column-major payload against the
+// variant that names it and returns the geometry it holds. Its length is the
+// only thing that identifies it, and it has to be the screen's own: an underscan
+// payload is 12288 bytes. The 16000-byte form this tool wrote before — an
+// underscan image padded inside the standard 80x200 frame — is refused with a
+// message that names it, since the file has to be rebuilt from its raw screen.
+func pksColumnMajorGeometry(variant compress.PKSVariant, payloadLen int) (numCol, numLig int, err error) {
+	numCol, numLig = pksColumnMajorScreen(variant)
+	if payloadLen == numCol*numLig {
+		return numCol, numLig, nil
+	}
+	if variant == compress.PKUL && payloadLen == cpc.StandardCols*cpc.StandardLines {
+		return 0, 0, fmt.Errorf("PKUL payload is %d bytes: an underscan image padded inside the standard 80x200 frame, the layout this tool no longer writes; re-pack the screen from its raw .SCR to get the %d-byte 64x192 payload",
+			payloadLen, cpc.UnderscanPixelBytes)
+	}
+	return 0, 0, fmt.Errorf("PKS %s payload is %d bytes, want the %d bytes of a %dx%d screen",
+		pksVariantName(variant), payloadLen, numCol*numLig, numCol, numLig)
 }
 
 // pksVariantIsPlus reports whether a variant packs a CPC Plus screen. Those
@@ -1648,17 +1673,19 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 			return fmt.Errorf("failed to unpack PKS input: %w", derr)
 		}
 		payload = depacked[:n]
-		if header != nil {
-			if screenSize, columnMajor := pksColumnMajorPayload(header.Variant); columnMajor {
-				screen := cpc.ColumnMajorToScreen(payload, cpc.StandardCols, cpc.StandardLines)
-				if screenSize < len(screen) {
-					screen = screen[:screenSize]
-				}
-				if anyNonZero(header.Palette[:]) {
-					screen = cpc.EmbedModePal(screen, header.Palette[:])
-				}
-				payload = screen
+		if header != nil && pksColumnMajorPayload(header.Variant) {
+			numCol, numLig, geoErr := pksColumnMajorGeometry(header.Variant, len(payload))
+			if geoErr != nil {
+				return fmt.Errorf("failed to unpack PKS input: %w", geoErr)
 			}
+			screen := cpc.ColumnMajorToScreen(payload, numCol, numLig)
+			if size := cpc.BitmapSize(numCol, numLig); size < len(screen) {
+				screen = screen[:size]
+			}
+			if anyNonZero(header.Palette[:]) {
+				screen = cpc.EmbedModePal(screen, header.Palette[:])
+			}
+			payload = screen
 		}
 	}
 
