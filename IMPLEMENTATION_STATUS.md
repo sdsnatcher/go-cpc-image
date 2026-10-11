@@ -30,6 +30,16 @@
   The PNG is emitted at the screen's own resolution: 320x200 / 256x192 / 384x272
   for modes 0 and 1 and 640x400 / 512x384 / 768x544 for mode 2, so the renderer's
   640-dot canvas is halved instead of written out as it is.
+- **PNG→SCR geometry:** `--geometry auto|standard|underscan|overscan` (default
+  `auto`; `--overscan` is kept as an alias) selects the scan area, and `auto` reads
+  it from the input's pixel size against the canvas, emitted and native grids —
+  exact matches only, with a standard screen and a `-v` note as the fallback. The
+  writing side can now produce the 15872-byte 64x192 underscan dump that
+  `pack --method pkul` compresses; `--resize fit|keepsmaller|keeplarger|origin`
+  decides how the source is fitted onto that grid.
+- **Screen PNG output knobs:** `--native` drops the PAR pre-compensation (the
+  picture is written on the screen's own grid — raw pixels) and `--scale N` zooms
+  by a whole factor after it, so no resampling is ever involved.
   A **PKS-compressed** screen (`*.pks`, or a packed sample under
   `samples/**/pk_compressed/`) is unpacked first and rendered the same way, so
   the packed and raw forms of a screen give identical PNGs; a variant the PKS

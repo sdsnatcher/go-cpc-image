@@ -64,7 +64,18 @@ cpc-image convert -i photo.png -o screen.scr -m 1
 - `-i, --input` - Input image file (required)
 - `-o, --output` - Output file (default: `gfx.scr`)
 - `-m, --mode` - CPC mode: 0, 1, or 2 (default: 1)
-- `--overscan` - Enable overscan mode (96x272 pixels)
+- `--geometry` - Screen geometry: `auto` (default), `standard` (80x200),
+  `underscan` (64x192) or `overscan` (96x272), case-insensitive. `--overscan` is
+  kept as an alias of `--geometry=overscan`; passing it with a different
+  `--geometry` is an error
+- `--resize` - How the source is mapped onto the screen: `fit` (stretch to fill,
+  default), `keepsmaller` (keep aspect, centre, and fill the rest with pen 0),
+  `keeplarger` (keep aspect, centre, and crop) or `origin` (no scaling: draw at
+  0,0 and clip), case-insensitive
+- `--native` - Write a screen PNG at the screen's own resolution instead of the
+  PAR-pre-compensated grid (raw pixels: it carries no aspect correction of its own)
+- `--scale` - Zoom a screen PNG by a whole factor (default: 1), applied after the
+  PAR step
 - `--plus` - Use CPC Plus mode (4096 colors instead of 27)
 - `-d, --dither` - Dithering method (default: `floyd-steinberg`)
 - `--dither-pct` - Dithering percentage 0-100 (default: 50)
@@ -98,6 +109,18 @@ cpc-image convert -i pic.png -o screen.scr -m 1 --palette screen.pal
 
 # SCR -> PNG honouring an external palette instead of the one in the screen
 cpc-image convert -i screen.scr -o screen.png --palette screen.pal
+
+# Underscan (64x192): a dump this tool can also write now, and pack as PKUL
+cpc-image convert -i pic.png -o screen.scr -m 1 --geometry underscan
+
+# Let the source's size choose the scan area: 256x192 reads back as mode-1 underscan
+cpc-image convert -i screen_underscan.png -o screen.scr -m 1 --geometry auto
+
+# Letterbox a square picture with pen 0 instead of stretching it
+cpc-image convert -i logo.png -o screen.scr -m 1 --resize keepsmaller
+
+# Write the screen PNG as raw pixels, twice as large
+cpc-image convert -i screen.scr -o screen.png --native --scale 2
 ```
 
 **Source palette handling:** `convert` honours a source palette, in this order:
@@ -118,6 +141,27 @@ represented: a warning is printed and the image is converted exactly like a
 truecolor one (its palette is ignored). When the input is an SCR and `--palette`
 is given, the screen's own ModePal is ignored — `-v` reports
 `using palette from <file> (SCR palette ignored)`.
+
+**Screen geometry:** `--geometry auto` (the default) reads the scan area from the
+input PNG's pixel size, because that is the only signal a bitmap carries. For the
+`-m/--mode` given, a size matches
+
+1. the renderer's canvas — 640x400 standard, 512x384 underscan, 768x544 overscan
+   (these do not depend on the mode);
+2. the grid this tool emits a screen PNG with — 320x200, 256x192 and 384x272 for
+   modes 0 and 1, the canvases above for mode 2;
+3. the screen's own native grid — 160x200, 128x192 and 192x272 for mode 0;
+   320x200, 256x192 and 384x272 for mode 1; 640x200, 512x192 and 768x272 for mode 2.
+
+The three families never name two scan areas in one mode, so the choice is exact
+rather than a guess, and re-converting a PNG this tool produced returns the
+geometry it came from. A size that matches nothing falls back to a standard 80x200
+screen, which `-v` reports. `-m/--mode` stays explicit: a 640x400 canvas is a
+standard screen in every mode, so the mode cannot come from the size.
+
+`--resize` chooses how the source is mapped onto the grid the geometry selected
+(see the flag list). `--native` and `--scale` apply to the PNG a screen is
+rendered to — not to a `.scr` output, which has one size.
 
 ### pack - Compress binary files
 

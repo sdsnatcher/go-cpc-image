@@ -685,7 +685,7 @@ func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 	params.NumLines = cpc.StandardLines
 	// params.Palette[0] = 0 (black) — the default pen-0
 
-	resized := resizeToCanvas(src, params)
+	resized := resizeToCanvas(src, params, "fit")
 
 	// Must be 320x200 (standard mode 1 screen), not 160x200.
 	if resized.Width() != 320 || resized.Height() != 200 {
@@ -714,7 +714,7 @@ func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 	rgParams := convert.NewDefaultSettings()
 	rgParams.NumCols = cpc.StandardCols
 	rgParams.NumLines = cpc.StandardLines
-	smallResized := resizeToCanvas(small, rgParams)
+	smallResized := resizeToCanvas(small, rgParams, "fit")
 	if smallResized.GetPixelColor(0, 0) != bg {
 		t.Errorf("background pixel (0,0) = %v, want pen-0 (black) for non-matching aspect",
 			smallResized.GetPixelColor(0, 0))
@@ -1884,6 +1884,23 @@ func resetConvertFlags(t *testing.T) {
 	}
 	if err := convertCmd.Flags().Set("overscan", "false"); err != nil {
 		t.Fatalf("reset --overscan failed: %v", err)
+	}
+	// --geometry is only an error in combination with --overscan, so it has to
+	// lose its "was set" bit as well: a leaked Changed would fake a conflict.
+	if f := convertCmd.Flags().Lookup("geometry"); f != nil {
+		if err := f.Value.Set("auto"); err != nil {
+			t.Fatalf("reset --geometry failed: %v", err)
+		}
+		f.Changed = false
+	}
+	if err := convertCmd.Flags().Set("resize", "fit"); err != nil {
+		t.Fatalf("reset --resize failed: %v", err)
+	}
+	if err := convertCmd.Flags().Set("native", "false"); err != nil {
+		t.Fatalf("reset --native failed: %v", err)
+	}
+	if err := convertCmd.Flags().Set("scale", "1"); err != nil {
+		t.Fatalf("reset --scale failed: %v", err)
 	}
 	// `-f png` with a bitmap input goes through the (unimplemented) PNG writer,
 	// so leaking it would break later PNG -> SCR tests.
@@ -3324,34 +3341,51 @@ func TestCLICMPUnsupportedMethod(t *testing.T) {
 // may move, the output bytes may not. Regenerate them only when a change to the
 // output is intended, and review the diff.
 var goldenSCR = map[string]string{
-	"m0-std":            "1b5d48218ead128e953218b3c217b0523b9df326bf01325e04d1556743ce0e4c",
-	"m0-std-floyd":      "b37014dd61bc9e666402702014d990af0dde80a907efb59d9e7a6c7be7c377f2",
-	"m0-overscan":       "f86d71992f831fa2ee4a6606fcb0e247236fff1fcd250d07e74effc075d1d28c",
-	"m0-overscan-floyd": "c3ede6ad97b3c6cfde6617e3faeea87cc086f4cbbe5c662abbfab2d8431c4a6a",
-	"m1-std":            "149d2e41c86d863c57f341b0f334fa82f1a74503f5630497991ff1b05f2e64e3",
-	"m1-std-floyd":      "2b373abe2d98de35bfcf71d08d2f9fa2a44bc0214ab78dd76c299f80849dc3ce",
-	"m1-overscan":       "fa2321daf4da366031267159decc35dd3471523031cde5b5aa41bf691b748707",
-	"m1-overscan-floyd": "5890e876cc96973c62514945c0676e2698557b773169b82b912b99741aa1d21a",
-	"m2-std":            "6e25af08b68d0ff8d68d61c25d620908f4490c0a3c140b71ac95f78e67e5a925",
-	"m2-std-floyd":      "5cef3bdffb7dce7a2d64f04df552d77500a4430452939ded09d430876f2c389a",
-	"m2-overscan":       "8197c40d4d2fe6c844e793eba89911f57721584b12f2190b5563e00132b7ae28",
-	"m2-overscan-floyd": "3e85aa6ba7deb553396a54deef113d461deb8b6dff174a6ed89bf64a0d3152e6",
-	"m0-std-plus":       "cc19377b363ad73aa9ce2faf97ffccaba70d8b169ec66ecda86b2eec601bdd87",
-	"m1-std-plus":       "14dc9f8ecae877310edf3fc73ea8d919c2e73949f86b754951b3d86dfa0392c1",
-	"m2-std-plus":       "8c86cdc70ec40fb17456d78d31260c4f5202756cb9271dfebb75becd6d26ccdb",
-	"m0-overscan-plus":  "2d24cdc2b1b47f65c693d199f0bf8d6d3694a7ba963690a159b4604b18d1f938",
+	"m0-std":                   "1b5d48218ead128e953218b3c217b0523b9df326bf01325e04d1556743ce0e4c",
+	"m0-std-floyd":             "b37014dd61bc9e666402702014d990af0dde80a907efb59d9e7a6c7be7c377f2",
+	"m0-overscan":              "f86d71992f831fa2ee4a6606fcb0e247236fff1fcd250d07e74effc075d1d28c",
+	"m0-overscan-floyd":        "c3ede6ad97b3c6cfde6617e3faeea87cc086f4cbbe5c662abbfab2d8431c4a6a",
+	"m1-std":                   "149d2e41c86d863c57f341b0f334fa82f1a74503f5630497991ff1b05f2e64e3",
+	"m1-std-floyd":             "2b373abe2d98de35bfcf71d08d2f9fa2a44bc0214ab78dd76c299f80849dc3ce",
+	"m1-overscan":              "fa2321daf4da366031267159decc35dd3471523031cde5b5aa41bf691b748707",
+	"m1-overscan-floyd":        "5890e876cc96973c62514945c0676e2698557b773169b82b912b99741aa1d21a",
+	"m2-std":                   "6e25af08b68d0ff8d68d61c25d620908f4490c0a3c140b71ac95f78e67e5a925",
+	"m2-std-floyd":             "5cef3bdffb7dce7a2d64f04df552d77500a4430452939ded09d430876f2c389a",
+	"m2-overscan":              "8197c40d4d2fe6c844e793eba89911f57721584b12f2190b5563e00132b7ae28",
+	"m2-overscan-floyd":        "3e85aa6ba7deb553396a54deef113d461deb8b6dff174a6ed89bf64a0d3152e6",
+	"m0-std-plus":              "cc19377b363ad73aa9ce2faf97ffccaba70d8b169ec66ecda86b2eec601bdd87",
+	"m1-std-plus":              "14dc9f8ecae877310edf3fc73ea8d919c2e73949f86b754951b3d86dfa0392c1",
+	"m2-std-plus":              "8c86cdc70ec40fb17456d78d31260c4f5202756cb9271dfebb75becd6d26ccdb",
+	"m0-overscan-plus":         "2d24cdc2b1b47f65c693d199f0bf8d6d3694a7ba963690a159b4604b18d1f938",
+	"m0-underscan":             "51052ed3ed41bab71e769364e551fce7a68693701697ea5b361ece89b9945dd2",
+	"m0-underscan-floyd":       "eef49248bdc8909de4ce1653e334acd1d2e0e276dbfe57dc3138eae4a8cb0ff1",
+	"m1-underscan":             "6097f22228de710459383738b5cc897c631700c33c9c6923433872f4bd1c687e",
+	"m1-underscan-floyd":       "151580f7cff1eebbe407066f06c0d067c9f51a1e9188074d0788b2d8b1e5bcfc",
+	"m2-underscan":             "4b0b9a18639b932bfbddcdba3791dc3c4df610b37be4d63357b81e7c05d1f451",
+	"m2-underscan-floyd":       "0040d4dff72ff1cd5431fa72366cc290b8bf8d6ac1ed5ae4a4fb0dfebbe69345",
+	"m0-underscan-plus":        "6aad55d82c7ade70c1246a8923df580f1cb822affff636e1078875b2cc6cb6f3",
+	"m1-auto-native-underscan": "11c85412180862696f6613491d1cf3fb84e86ddeda013a06227232436d4f029f",
+	"m1-auto-canvas-standard":  "9944138f482eeb389e08d23e6716d609b7e43724af2f810e062e003eaf91081c",
 }
 
 // goldenSource builds a deterministic source picture: two colour gradients with
 // a checkerboard swap on top, so a sampling or resampling change anywhere in the
-// pipeline shows up in the output bytes.
+// pipeline shows up in the output bytes. The default size is the one the pinned
+// hashes were generated with; a case that wants `--geometry auto` to read a
+// different scan area asks for a source of that grid's size.
 func goldenSource() *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, 200, 150))
-	for y := 0; y < 150; y++ {
-		for x := 0; x < 200; x++ {
-			r := uint8(x * 255 / 199)
-			g := uint8(y * 255 / 149)
-			b := uint8((x + y) * 255 / 348)
+	return goldenSourceSize(200, 150)
+}
+
+// goldenSourceSize is goldenSource at an arbitrary size, with the same pattern:
+// the gradients are relative to the size, so 200x150 reproduces the original bytes.
+func goldenSourceSize(w, h int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r := uint8(x * 255 / (w - 1))
+			g := uint8(y * 255 / (h - 1))
+			b := uint8((x + y) * 255 / (w + h - 2))
 			if (x/16+y/16)%2 == 0 {
 				r, g, b = g, b, r
 			}
@@ -3385,6 +3419,25 @@ func TestCLIConvertPNGToSCRGolden(t *testing.T) {
 		{"m1-std-plus", []string{"-m", "1", "--plus", "-d", "none"}},
 		{"m2-std-plus", []string{"-m", "2", "--plus", "-d", "none"}},
 		{"m0-overscan-plus", []string{"-m", "0", "--overscan", "--plus", "-d", "none"}},
+		{"m0-underscan", []string{"-m", "0", "--geometry", "underscan", "-d", "none"}},
+		{"m0-underscan-floyd", []string{"-m", "0", "--geometry", "underscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m1-underscan", []string{"-m", "1", "--geometry", "underscan", "-d", "none"}},
+		{"m1-underscan-floyd", []string{"-m", "1", "--geometry", "underscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m2-underscan", []string{"-m", "2", "--geometry", "underscan", "-d", "none"}},
+		{"m2-underscan-floyd", []string{"-m", "2", "--geometry", "underscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m0-underscan-plus", []string{"-m", "0", "--geometry", "underscan", "--plus", "-d", "none"}},
+		// `auto` reads the scan area from the source's pixel size: a picture drawn
+		// at the grid this tool emits for a mode-1 underscan screen (256x192) comes
+		// back as an underscan screen, and a canvas-sized one as a standard screen.
+		{"m1-auto-native-underscan", []string{"-m", "1", "--geometry", "auto", "-d", "none"}},
+		{"m1-auto-canvas-standard", []string{"-m", "1", "--geometry", "auto", "-d", "none"}},
+	}
+
+	// The `--geometry auto` rows need a source of a particular size, because the
+	// size is the input the rule reads. Every other case uses the default source.
+	autoSources := map[string][2]int{
+		"m1-auto-native-underscan": {256, 192},
+		"m1-auto-canvas-standard":  {640, 400},
 	}
 
 	// The golden values are generated from the code under test, on demand:
@@ -3401,7 +3454,11 @@ func TestCLIConvertPNGToSCRGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create source failed: %v", err)
 			}
-			if err := png.Encode(f, goldenSource()); err != nil {
+			src := goldenSource()
+			if size, ok := autoSources[tc.name]; ok {
+				src = goldenSourceSize(size[0], size[1])
+			}
+			if err := png.Encode(f, src); err != nil {
 				f.Close()
 				t.Fatalf("encode source failed: %v", err)
 			}

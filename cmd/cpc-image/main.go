@@ -36,6 +36,10 @@ var (
 	outputFile   string
 	mode         int
 	overscan     bool
+	geometry     string
+	resizePolicy string
+	nativeOut    bool
+	scaleFactor  int
 	plus         bool
 	ditherMethod string
 	ditherPct    int
@@ -179,7 +183,16 @@ func init() {
 	convertCmd.Flags().StringVarP(&inputFile, "input", "i", "", "input image file (required)")
 	convertCmd.Flags().StringVarP(&outputFile, "output", "o", "gfx.scr", "output file")
 	convertCmd.Flags().IntVarP(&mode, "mode", "m", 1, "CPC mode: 0, 1, or 2")
-	convertCmd.Flags().BoolVar(&overscan, "overscan", false, "enable overscan mode (96x272)")
+	convertCmd.Flags().StringVar(&geometry, "geometry", "auto",
+		fmt.Sprintf("screen geometry (%s); auto reads it from the input's pixel size",
+			strings.Join(geometryNames, ", ")))
+	convertCmd.Flags().BoolVar(&overscan, "overscan", false, "alias of --geometry=overscan (96x272)")
+	convertCmd.Flags().StringVar(&resizePolicy, "resize", "fit",
+		fmt.Sprintf("how the source is mapped onto the screen (%s)", strings.Join(resizePolicies, ", ")))
+	convertCmd.Flags().BoolVar(&nativeOut, "native", false,
+		"write a screen PNG at the screen's own resolution (raw pixels: no PAR compensation of its own)")
+	convertCmd.Flags().IntVar(&scaleFactor, "scale", 1,
+		"zoom a screen PNG by a whole factor, applied after the PAR step")
 	convertCmd.Flags().BoolVar(&plus, "plus", false, "CPC Plus mode (4096 colors)")
 	convertCmd.Flags().StringVarP(&ditherMethod, "dither", "d", "floyd-steinberg",
 		fmt.Sprintf("dithering method (%s)", strings.Join(availableDitherMethods, ", ")))
@@ -224,6 +237,13 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	// Validate input file exists
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
 		return fmt.Errorf("input file does not exist: %s", inputFile)
+	}
+
+	// The output knobs are validated before anything else: a .scr input returns
+	// early into its own path, and a --scale that would mash pixels must fail
+	// there too, not only on the bitmap path.
+	if scaleFactor < 1 {
+		return fmt.Errorf("invalid scale: %d (must be 1 or more)", scaleFactor)
 	}
 
 	// An .SCR is a CPC screen dump and a .CMP is the same dump compressed with
@@ -275,9 +295,6 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Converting %s to %s\n", inputFile, outputFile)
 		fmt.Printf("Mode: %d, Dither: %s (%d%%), Format: %s\n",
 			mode, ditherMethod, ditherPct, format)
-		if overscan {
-			fmt.Println("Overscan mode enabled")
-		}
 		if plus {
 			fmt.Println("CPC Plus mode enabled")
 		}
@@ -310,12 +327,33 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	params.Pct = ditherPct
 	params.CpcPlus = plus
 
-	if overscan {
-		params.NumCols = 96
-		params.NumLines = 272
-	} else {
-		params.NumCols = 80
-		params.NumLines = 200
+	// The scan area is one of the three the CPC knows (see geometry.go): the
+	// selected one, or the one the input's pixel size names — the only signal a
+	// bitmap carries. A size that names no screen falls back to a standard screen,
+	// which -v reports.
+	geomFlag, err := parseGeometry(geometry, cmd.Flags().Changed("geometry"), overscan)
+	if err != nil {
+		return err
+	}
+	geom := geomStandard
+	switch geomFlag {
+	case "underscan":
+		geom = geomUnderscan
+	case "overscan":
+		geom = geomOverscan
+	case "auto":
+		if matched, ok := geometryForSize(mode, directBitmap.Width(), directBitmap.Height()); ok {
+			geom = matched
+		} else if verbose {
+			fmt.Fprintf(cmd.ErrOrStderr(), "No screen size matched %dx%d; using a %s %dx%d screen\n",
+				directBitmap.Width(), directBitmap.Height(),
+				geomStandard.name, geomStandard.cols, geomStandard.lines)
+		}
+	}
+	params.NumCols = geom.cols
+	params.NumLines = geom.lines
+	if verbose {
+		fmt.Fprintf(cmd.ErrOrStderr(), "Geometry: %s (%dx%d)\n", geom.name, geom.cols, geom.lines)
 	}
 
 	// Honour a source palette, in order of priority (rule 1): an explicit
@@ -335,10 +373,15 @@ func runConvert(cmd *cobra.Command, args []string) error {
 		paletteLocked = true
 	}
 
-	// Scale the source image to the CPC canvas size
-	// so that small images fill the full screen instead of only 1/4 of it
-	// (out-of-grid reads -> black). Nearest-neighbour stretch; pen-0 fills gaps.
-	directBitmap = resizeToCanvas(directBitmap, params)
+	// Map the source picture onto the screen grid with the --resize policy: fit
+	// stretches it over the whole screen (the behaviour before the flag existed),
+	// the aspect-preserving policies centre it and either leave a band of pen-0
+	// background or crop it, and origin copies it at 1:1 and clips.
+	resizeFit, err := parseResizePolicy(resizePolicy)
+	if err != nil {
+		return err
+	}
+	directBitmap = resizeToCanvas(directBitmap, params, resizeFit)
 
 	// Create destination image
 	bitmapCpc := render.NewBitmapCpcWithParams(params.NumCols, params.NumLines, params.CpcPlus)
@@ -1339,13 +1382,14 @@ func mapDitherMethod(method string) string {
 	}
 }
 
-// resizeToCanvas scales the source bitmap to the CPC display canvas so that
-// a small source image fills the full screen (640x400 standard, 768x544
-// overscan) instead of being rendered at 1:1 and reading out-of-grid pixels.
-// Uses nearest-neighbour stretch; the background is filled with pen 0 color
-// (mirrors the GUI getResizeBitmap). Known limitation: native-resolution
-// fidelity is only approximate; TODO: non-integer resize and overscan
-func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.DirectBitmap {
+// resizeToCanvas maps the source picture onto the screen grid the settings carry
+// — the conversion buffer, which since the native-resolution work is the screen's
+// own grid — so a small source fills the screen instead of being rendered at 1:1
+// and reading out-of-grid pixels. The --resize policy decides the rectangle the
+// picture lands in (see screenRect), the background is the pen-0 colour (mirrors
+// the GUI getResizeBitmap) and only whole pixels move: the mapping is nearest
+// neighbour and never blends, so a pen colour comes through exactly.
+func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings, policy string) *bitmap.DirectBitmap {
 	cpcW := prm.GetScreenWidth()
 	cpcH := prm.GetScreenHeight()
 
@@ -1364,16 +1408,25 @@ func resizeToCanvas(source *bitmap.DirectBitmap, prm *convert.Settings) *bitmap.
 		return resized
 	}
 
+	dstW, dstH, offX, offY := screenRect(policy, srcW, srcH, cpcW, cpcH)
+	if dstW <= 0 || dstH <= 0 {
+		return resized
+	}
+
 	for dy := 0; dy < cpcH; dy++ {
-		srcY := dy * srcH / cpcH
-		if srcY >= srcH {
-			srcY = srcH - 1
+		// The range check is what decides between picture and background: working
+		// it out here, instead of from the division, keeps the mapping exact for
+		// the rows and columns left of the rectangle (a negative numerator would
+		// truncate towards zero and sample column 0 of the picture).
+		if dy < offY || dy >= offY+dstH {
+			continue // off the picture: the background (or the crop) stands
 		}
+		srcY := (dy - offY) * srcH / dstH
 		for dx := 0; dx < cpcW; dx++ {
-			srcX := dx * srcW / cpcW
-			if srcX >= srcW {
-				srcX = srcW - 1
+			if dx < offX || dx >= offX+dstW {
+				continue
 			}
+			srcX := (dx - offX) * srcW / dstW
 			resized.SetPixelColor(dx, dy, source.GetPixelColor(srcX, srcY))
 		}
 	}
@@ -1622,6 +1675,28 @@ func scrOutputSize(numCol, numLig, mode int) (width, height int) {
 	return numCol * 8 / div, numLig * 2 / div
 }
 
+// screenOutputSize returns the size the PNG of a screen is emitted at once the
+// output knobs are applied to scrOutputSize's PAR-pre-compensated grid:
+//
+//   - --native drops the pre-compensation, so the picture is written on the
+//     screen's own grid (numCol<<(mode+1) x numLig: 160x200, 320x200 and 640x200
+//     for a standard screen in modes 0, 1 and 2). It carries no aspect correction
+//     of its own — these are raw pixels — which is what the flag's help says.
+//   - --scale then zooms uniformly by a whole factor, whatever the step before
+//     produced. Integer only, so no resampling happens and the pens survive.
+//
+// Neither knob applies to a .scr output: a screen dump has one size.
+func screenOutputSize(numCol, numLig, mode int, native bool, scale int) (width, height int) {
+	width, height = scrOutputSize(numCol, numLig, mode)
+	if native {
+		width, height = numCol<<(mode+1), numLig
+	}
+	if scale < 1 {
+		scale = 1
+	}
+	return width * scale, height * scale
+}
+
 // scaleImage resamples a rendered frame to dstW x dstH by nearest neighbour:
 // whole pixels are replicated or dropped, never blended, so a pen colour comes
 // through exactly and an integer factor stays exact. It is the output
@@ -1793,9 +1868,10 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 	}
 
 	// Output stage: the canvas is written out at the screen's own resolution
-	// instead of the renderer's magnified one. The scaler drops whole pixels, so
-	// the pens survive exactly.
-	outW, outH := scrOutputSize(numCol, numLig, bmp.VirtualMode)
+	// instead of the renderer's magnified one, and the --native / --scale knobs
+	// decide what a pixel of that output is worth. The scaler only replicates or
+	// drops whole pixels, so the pens survive exactly.
+	outW, outH := screenOutputSize(numCol, numLig, bmp.VirtualMode, nativeOut, scaleFactor)
 	img = scaleImage(img, outW, outH)
 
 	file, err := os.Create(outputFile)
