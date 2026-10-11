@@ -296,19 +296,31 @@ func TestFullPipelineStripes(t *testing.T) {
 		}
 	}
 
-	// Verify the rendered output has correct stripes at known positions
+	// Verify the rendered output has correct stripes at known positions.
+	// RenderToRGBA draws the display canvas (NumCols*8 x NumLig*2), so the
+	// screen grid sampled here maps onto it at the mode's pixel width.
 	rendered := bmpCpc.RenderToRGBA()
+	canvasW := rendered.Rect.Dx()
+	canvasH := rendered.Rect.Dy()
+	pixW := cpc.PixelWidth(prm.VirtualMode, 0, prm.YEgx)
+	if pixW < 1 {
+		pixW = 1
+	}
+	rowW := canvasH / height
+	if rowW < 1 {
+		rowW = 1
+	}
 	for _, stripeIdx := range []int{0, 1, 2, 3} {
-		// Sample from the middle of each stripe
-		x := (stripeIdx*width/len(stripeColors) + width/len(stripeColors)/2)
+		// Sample from the middle of each stripe, on the canvas grid
+		x := (stripeIdx*width/len(stripeColors) + width/len(stripeColors)/2) * pixW
 		x = x &^ 3 // Align to 4-pixel boundary (Mode 0)
-		y := height / 2
+		y := (height / 2) * rowW
 		y = y &^ 1 // Align to even scanline
 
 		expected := cpc.CpcRgbPalette[stripeColors[stripeIdx]]
-		r := rendered.Pix[(y*width+x)*4+0]
-		g := rendered.Pix[(y*width+x)*4+1]
-		b := rendered.Pix[(y*width+x)*4+2]
+		r := rendered.Pix[(y*canvasW+x)*4+0]
+		g := rendered.Pix[(y*canvasW+x)*4+1]
+		b := rendered.Pix[(y*canvasW+x)*4+2]
 
 		if r != expected.R || g != expected.V || b != expected.B {
 			t.Errorf("Stripe %d at (%d,%d): got RGB(%d,%d,%d), want RGB(%d,%d,%d)",

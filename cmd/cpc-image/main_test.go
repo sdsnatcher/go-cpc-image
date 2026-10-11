@@ -668,8 +668,8 @@ func TestCLIConvertPNGToSCRSize(t *testing.T) {
 }
 
 // TestResizeToCanvasScalesSmallImage verifies that a small
-// source bitmap is scaled to fill the entire CPC canvas (640x400 standard)
-// instead of being used at 1:1 (which left 3/4 of the screen unread).
+// source bitmap is scaled to fill the entire CPC screen (320x200 standard mode 1)
+// instead of being used at 1:1 (which left part of the screen unread).
 func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 	src := bitmap.NewDirectBitmap(160, 200)
 	// Fill with bright red (pen 1 = 0x00F → RGB 255,0,0)
@@ -687,27 +687,26 @@ func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 
 	resized := resizeToCanvas(src, params)
 
-	// Must be 640x400 (standard CPC canvas), not 160x200.
-	if resized.Width() != 640 || resized.Height() != 400 {
-		t.Fatalf("resized dims = %dx%d, want 640x400", resized.Width(), resized.Height())
+	// Must be 320x200 (standard mode 1 screen), not 160x200.
+	if resized.Width() != 320 || resized.Height() != 200 {
+		t.Fatalf("resized dims = %dx%d, want 320x200", resized.Width(), resized.Height())
 	}
 
-	// Nearest-neighbour stretch: source (160,200) → output block at (4,4)-(7,7).
+	// Nearest-neighbour stretch: source (160,200) → output (320,200).
 	// Every pixel must match the source (all red) since the whole source is red.
 	sample := resized.GetPixelColor(4, 4)
 	if sample != red {
 		t.Errorf("pixel at (4,4) = %v, want %v (nearest-neighbour stretch of red)",
 			sample, red)
 	}
-	sample = resized.GetPixelColor(639, 399)
+	sample = resized.GetPixelColor(319, 199)
 	if sample != red {
-		t.Errorf("pixel at (639,399) = %v, want %v (bottom-right corner)",
+		t.Errorf("pixel at (319,199) = %v, want %v (bottom-right corner)",
 			sample, red)
 	}
 
-	// Pen-0 background color check: with a 160x200→640x400 stretch (4x), the
-	// whole canvas is covered. With a non-matching aspect (e.g., 200x100 →
-	// 640x400 = 3.2x, 4x), the background pen-0 must fill the gaps.
+	// Pen-0 background check: with a 160x200→320x200 stretch the whole screen is
+	// covered; a source that does not divide evenly still fills pen 0 first.
 	bg := cpc.GetColor(0, false) // black
 	// Verify a small source that doesn't perfectly tile shows background.
 	small := bitmap.NewDirectBitmap(100, 100)
@@ -720,12 +719,15 @@ func TestResizeToCanvasScalesSmallImage(t *testing.T) {
 		t.Errorf("background pixel (0,0) = %v, want pen-0 (black) for non-matching aspect",
 			smallResized.GetPixelColor(0, 0))
 	}
-	// The red pixel at (50,50) in 100x100 maps to a block in 640x400.
-	// srcX = dx*100/640, so dx ~ 50*640/100 = 320 should map back to x=50.
-	mappedX := 320 * 100 / 640
-	if mappedX == 50 && smallResized.GetPixelColor(320, 200) != cpc.GetColor(1, false) {
-		t.Errorf("scaled red pixel at (320,200) = %v, want red",
-			smallResized.GetPixelColor(320, 200))
+	// The red pixel at (50,50) in 100x100 maps onto the screen grid.
+	// srcX = dx*srcW/dstW, so dx = 50*dstW/srcW maps back to x=50.
+	rgW, rgH := rgParams.GetScreenWidth(), rgParams.GetScreenHeight()
+	mappedX := 50 * rgW / 100
+	mappedY := 50 * rgH / 100
+	if mappedX < rgW && mappedY < rgH && mappedX*100/rgW == 50 &&
+		smallResized.GetPixelColor(mappedX, mappedY) != cpc.GetColor(1, false) {
+		t.Errorf("scaled red pixel at (%d,%d) = %v, want red",
+			mappedX, mappedY, smallResized.GetPixelColor(mappedX, mappedY))
 	}
 }
 
