@@ -4,7 +4,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"image"
 	"image/color"
 	"image/png"
@@ -3309,6 +3311,122 @@ func TestCLICMPUnsupportedMethod(t *testing.T) {
 			}
 			if _, serr := os.Stat(tc.out); serr == nil {
 				t.Errorf("a file was written for an unsupported .CMP")
+			}
+		})
+	}
+}
+
+// goldenSCR holds the SHA-256 of the .scr every PNG->SCR conversion below
+// produces. They are the safety net for refactors that must not change what the
+// tool converts — the native-canvas work in particular: the pipeline's internals
+// may move, the output bytes may not. Regenerate them only when a change to the
+// output is intended, and review the diff.
+var goldenSCR = map[string]string{
+	"m0-std":            "1b5d48218ead128e953218b3c217b0523b9df326bf01325e04d1556743ce0e4c",
+	"m0-std-floyd":      "b37014dd61bc9e666402702014d990af0dde80a907efb59d9e7a6c7be7c377f2",
+	"m0-overscan":       "f86d71992f831fa2ee4a6606fcb0e247236fff1fcd250d07e74effc075d1d28c",
+	"m0-overscan-floyd": "c3ede6ad97b3c6cfde6617e3faeea87cc086f4cbbe5c662abbfab2d8431c4a6a",
+	"m1-std":            "149d2e41c86d863c57f341b0f334fa82f1a74503f5630497991ff1b05f2e64e3",
+	"m1-std-floyd":      "2b373abe2d98de35bfcf71d08d2f9fa2a44bc0214ab78dd76c299f80849dc3ce",
+	"m1-overscan":       "fa2321daf4da366031267159decc35dd3471523031cde5b5aa41bf691b748707",
+	"m1-overscan-floyd": "5890e876cc96973c62514945c0676e2698557b773169b82b912b99741aa1d21a",
+	"m2-std":            "6e25af08b68d0ff8d68d61c25d620908f4490c0a3c140b71ac95f78e67e5a925",
+	"m2-std-floyd":      "5cef3bdffb7dce7a2d64f04df552d77500a4430452939ded09d430876f2c389a",
+	"m2-overscan":       "8197c40d4d2fe6c844e793eba89911f57721584b12f2190b5563e00132b7ae28",
+	"m2-overscan-floyd": "3e85aa6ba7deb553396a54deef113d461deb8b6dff174a6ed89bf64a0d3152e6",
+	"m0-std-plus":       "cc19377b363ad73aa9ce2faf97ffccaba70d8b169ec66ecda86b2eec601bdd87",
+	"m1-std-plus":       "14dc9f8ecae877310edf3fc73ea8d919c2e73949f86b754951b3d86dfa0392c1",
+	"m2-std-plus":       "8c86cdc70ec40fb17456d78d31260c4f5202756cb9271dfebb75becd6d26ccdb",
+	"m0-overscan-plus":  "2d24cdc2b1b47f65c693d199f0bf8d6d3694a7ba963690a159b4604b18d1f938",
+}
+
+// goldenSource builds a deterministic source picture: two colour gradients with
+// a checkerboard swap on top, so a sampling or resampling change anywhere in the
+// pipeline shows up in the output bytes.
+func goldenSource() *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, 200, 150))
+	for y := 0; y < 150; y++ {
+		for x := 0; x < 200; x++ {
+			r := uint8(x * 255 / 199)
+			g := uint8(y * 255 / 149)
+			b := uint8((x + y) * 255 / 348)
+			if (x/16+y/16)%2 == 0 {
+				r, g, b = g, b, r
+			}
+			img.Set(x, y, color.RGBA{R: r, G: g, B: b, A: 255})
+		}
+	}
+	return img
+}
+
+// TestCLIConvertPNGToSCRGolden pins the bytes of every PNG->SCR conversion in a
+// matrix of modes, scan areas, palettes and dithering. It is the main safety net
+// for the native-canvas refactor: whatever moves inside, these bytes stay.
+func TestCLIConvertPNGToSCRGolden(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"m0-std", []string{"-m", "0", "-d", "none"}},
+		{"m0-std-floyd", []string{"-m", "0", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m0-overscan", []string{"-m", "0", "--overscan", "-d", "none"}},
+		{"m0-overscan-floyd", []string{"-m", "0", "--overscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m1-std", []string{"-m", "1", "-d", "none"}},
+		{"m1-std-floyd", []string{"-m", "1", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m1-overscan", []string{"-m", "1", "--overscan", "-d", "none"}},
+		{"m1-overscan-floyd", []string{"-m", "1", "--overscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m2-std", []string{"-m", "2", "-d", "none"}},
+		{"m2-std-floyd", []string{"-m", "2", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m2-overscan", []string{"-m", "2", "--overscan", "-d", "none"}},
+		{"m2-overscan-floyd", []string{"-m", "2", "--overscan", "-d", "floyd-steinberg", "--dither-pct", "70"}},
+		{"m0-std-plus", []string{"-m", "0", "--plus", "-d", "none"}},
+		{"m1-std-plus", []string{"-m", "1", "--plus", "-d", "none"}},
+		{"m2-std-plus", []string{"-m", "2", "--plus", "-d", "none"}},
+		{"m0-overscan-plus", []string{"-m", "0", "--overscan", "--plus", "-d", "none"}},
+	}
+
+	// The golden values are generated from the code under test, on demand:
+	// GOLDEN_UPDATE=1 go test -run TestCLIConvertPNGToSCRGolden ./cmd/cpc-image/
+	// prints them to paste below (and to review). Without it a missing entry is a
+	// failure, so a new case cannot slip in unpinned.
+	update := os.Getenv("GOLDEN_UPDATE") != ""
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			inPath := filepath.Join(tempDir, "source.png")
+			f, err := os.Create(inPath)
+			if err != nil {
+				t.Fatalf("create source failed: %v", err)
+			}
+			if err := png.Encode(f, goldenSource()); err != nil {
+				f.Close()
+				t.Fatalf("encode source failed: %v", err)
+			}
+			f.Close()
+
+			// A fixed output name: the AMSDOS header a .scr carrys names the output
+			// file, so the bytes have to be reproducible across runs.
+			outPath := filepath.Join(tempDir, "golden.scr")
+			resetConvertFlags(t)
+			defer resetConvertFlags(t)
+			rootCmd.SetArgs(append([]string{"convert", "-i", inPath, "-o", outPath}, tc.args...))
+			if err := rootCmd.Execute(); err != nil {
+				t.Fatalf("convert failed: %v", err)
+			}
+
+			sum := sha256.Sum256(mustRead(t, outPath))
+			hash := hex.EncodeToString(sum[:])
+			want, pinned := goldenSCR[tc.name]
+			if update {
+				t.Logf("		%q: %q,", tc.name, hash)
+				return
+			}
+			if !pinned {
+				t.Fatalf("no golden value pinned for %s (computed %s); run with GOLDEN_UPDATE=1", tc.name, hash)
+			}
+			if hash != want {
+				t.Errorf("PNG->SCR output changed: %s, want %s", hash, want)
 			}
 		})
 	}
