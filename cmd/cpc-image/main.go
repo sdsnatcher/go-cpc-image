@@ -1658,78 +1658,58 @@ func scrGeometry(payloadLen int) (numCol, numLig int, known bool) {
 	return 0, 0, false
 }
 
-// scrOutputSize returns the size the PNG of a screen is emitted at. The renderer
-// draws on a display canvas of NumCol*8 by NumLig*2 — a fixed 640-dot timeline
-// in which a mode-0 pixel spans 4 canvas dots, a mode-1 pixel 2 and a mode-2
-// pixel 1 — so the canvas magnifies the picture and cannot be written out as it
-// is. Halving both axes for modes 0 and 1 emits the screen at its own
-// resolution (320x200 standard, 256x192 underscan, 384x272 overscan) while
-// preserving the canvas's pixel aspect; mode 2, whose pixels are one canvas dot
-// wide already, keeps the whole canvas (640x400 / 512x384 / 768x544) so that
-// halving does not throw away half of its horizontal detail.
-func scrOutputSize(numCol, numLig, mode int) (width, height int) {
-	div := 2
-	if mode == 2 {
-		div = 1
+// scrNativeSize returns the grid of the screen's own pixels: one buffer pixel per
+// picture pixel — each of the numCol bytes holds 8/tx of them, tx being the mode's
+// pixel width — and one row per CRTC line. It is the grid the renderer draws a
+// standard screen on, and the grid --native writes.
+func scrNativeSize(numCol, numLig, mode int) (width, height int) {
+	tx := cpc.PixelWidth(mode, 0, 0)
+	if tx < 1 {
+		tx = 1
 	}
-	return numCol * 8 / div, numLig * 2 / div
+	return numCol * 8 / tx, numLig
+}
+
+// scrOutputSize returns the grid a screen PNG is emitted at by default: the
+// screen's own grid with the duplication the mode's pixels need to come out square
+// — twice across in mode 0, twice down in mode 2, once in mode 1, the same table
+// pixelDuplication declares the density from. A standard screen is therefore
+// written at 320x200 in modes 0 and 1 and 640x400 in mode 2, and an underscan or
+// overscan screen follows its own geometry.
+//
+// The modes the renderer draws on its display canvas instead — EGX 3/4, whose lines
+// alternate two pixel widths, and the per-line-table modes — keep the halved canvas
+// this tool has always written for them: no grid of their own describes them.
+func scrOutputSize(numCol, numLig, mode int) (width, height int) {
+	if mode < 0 || mode > 2 {
+		return numCol * 8 / 2, numLig * 2 / 2
+	}
+	width, height = scrNativeSize(numCol, numLig, mode)
+	dupX, dupY := pixelDuplication(mode, false)
+	return width * int(dupX), height * int(dupY)
 }
 
 // screenOutputSize returns the size the PNG of a screen is emitted at once the
-// output knobs are applied to scrOutputSize's PAR-pre-compensated grid:
+// output knobs are applied:
 //
 //   - --native drops the pre-compensation, so the picture is written on the
-//     screen's own grid (numCol<<(mode+1) x numLig: 160x200, 320x200 and 640x200
-//     for a standard screen in modes 0, 1 and 2). It carries no aspect correction
-//     of its own — these are raw pixels — which is what the flag's help says.
+//     screen's own grid (160x200, 320x200 and 640x200 for a standard screen in
+//     modes 0, 1 and 2). It carries no aspect correction of its own — these are
+//     raw pixels — which is what the flag's help says.
 //   - --scale then zooms uniformly by a whole factor, whatever the step before
 //     produced. Integer only, so no resampling happens and the pens survive.
 //
 // Neither knob applies to a .scr output: a screen dump has one size.
 func screenOutputSize(numCol, numLig, mode int, native bool, scale int) (width, height int) {
-	width, height = scrOutputSize(numCol, numLig, mode)
 	if native {
-		width, height = numCol<<(mode+1), numLig
+		width, height = scrNativeSize(numCol, numLig, mode)
+	} else {
+		width, height = scrOutputSize(numCol, numLig, mode)
 	}
 	if scale < 1 {
 		scale = 1
 	}
 	return width * scale, height * scale
-}
-
-// scaleImage resamples a rendered frame to dstW x dstH by nearest neighbour:
-// whole pixels are replicated or dropped, never blended, so a pen colour comes
-// through exactly and an integer factor stays exact. It is the output
-// counterpart of resizeToCanvas — the same integer mapping, applied to the
-// rendered CPC canvas instead of to the source picture — and it is generic so
-// that a screen rendered at another resolution can be brought to the same
-// emitted grid.
-func scaleImage(src *image.RGBA, dstW, dstH int) *image.RGBA {
-	if src == nil || dstW <= 0 || dstH <= 0 {
-		return src
-	}
-	b := src.Bounds()
-	if b.Dx() == dstW && b.Dy() == dstH {
-		return src
-	}
-
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	for y := 0; y < dstH; y++ {
-		sy := b.Min.Y + y*b.Dy()/dstH
-		if sy >= b.Max.Y {
-			sy = b.Max.Y - 1
-		}
-		row := dst.PixOffset(0, y)
-		for x := 0; x < dstW; x++ {
-			sx := b.Min.X + x*b.Dx()/dstW
-			if sx >= b.Max.X {
-				sx = b.Max.X - 1
-			}
-			si := src.PixOffset(sx, sy)
-			copy(dst.Pix[row+x*4:], src.Pix[si:si+4])
-		}
-	}
-	return dst
 }
 
 // convertSCRToPNG converts an Amstrad CPC SCR screen into a PNG rendering.
@@ -1867,12 +1847,11 @@ func convertSCRToPNG(inputFile, outputFile string, warn io.Writer, verbose bool)
 		return fmt.Errorf("failed to render SCR screen data")
 	}
 
-	// Output stage: the canvas is written out at the screen's own resolution
-	// instead of the renderer's magnified one, and the --native / --scale knobs
-	// decide what a pixel of that output is worth. The scaler only replicates or
-	// drops whole pixels, so the pens survive exactly.
+	// Output stage: the renderer drew the screen on its own grid, so reaching the
+	// grid the file is written at is a whole-pixel duplication — the mode's PAR
+	// pre-compensation and then --scale — and no pen colour is blended or lost.
 	outW, outH := screenOutputSize(numCol, numLig, bmp.VirtualMode, nativeOut, scaleFactor)
-	img = scaleImage(img, outW, outH)
+	img = bitmap.ScaleImage(img, outW, outH)
 
 	file, err := os.Create(outputFile)
 	if err != nil {

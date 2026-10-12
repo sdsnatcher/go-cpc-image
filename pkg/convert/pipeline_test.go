@@ -48,9 +48,11 @@ func TestMode0EncodeDecodeRoundtrip(t *testing.T) {
 	// Decode back
 	result := bmpCpc.DrawBitmap(numCol, numLig, 0, false)
 
-	// Verify each pen roundtripped correctly at y=0
+	// Verify each pen roundtripped correctly at y=0. The picture comes back on the
+	// screen's own grid — one rendered pixel per picture pixel — so pen p sits at
+	// x=p, whatever column the canvas fixture wrote it as.
 	for pen := 0; pen < 16; pen++ {
-		x := pen * 4
+		x := pen
 		got := result.GetPixelColor(x, 0)
 		expected := cpc.GetColor(pen, false)
 
@@ -84,8 +86,10 @@ func TestMode1EncodeDecodeRoundtrip(t *testing.T) {
 	bmpCpc.EncodeToCpc(displayBmp, false, 0)
 	result := bmpCpc.DrawBitmap(numCol, numLig, 0, false)
 
+	// The screen's own grid again: mode 1 holds 4 picture pixels per byte, so the
+	// pens come back at x=0..3.
 	for pen := 0; pen < 4; pen++ {
-		x := pen * 2
+		x := pen
 		got := result.GetPixelColor(x, 0)
 		expected := cpc.GetColor(bmpCpc.Palette[pen], false)
 
@@ -190,8 +194,8 @@ func TestConvertPipeline_SolidColorPreservedThroughQuantization(t *testing.T) {
 	prm.NumLines = 200
 	prm.Pct = 0 // No dithering
 
-	width := prm.GetScreenWidth()   // 640
-	height := prm.GetScreenHeight() // 400
+	width := prm.GetScreenWidth()   // 160: the screen's own grid
+	height := prm.GetScreenHeight() // 200
 
 	source := bitmap.NewDirectBitmap(width, height)
 	for y := 0; y < height; y++ {
@@ -297,9 +301,10 @@ func TestFullPipelineStripes(t *testing.T) {
 	}
 
 	// Verify the rendered output has correct stripes at known positions.
-	// RenderToRGBA draws the display canvas (NumCols*8 x NumLig*2), so the
-	// screen grid sampled here maps onto it at the mode's pixel width.
-	rendered := bmpCpc.RenderToRGBA()
+	// RenderToRGBADisplay draws the display canvas (NumCols*8 x NumLig*2) the
+	// screen's own grid is magnified onto, so a picture pixel sits at the mode's
+	// pixel width there.
+	rendered := bmpCpc.RenderToRGBADisplay()
 	canvasW := rendered.Rect.Dx()
 	canvasH := rendered.Rect.Dy()
 	pixW := cpc.PixelWidth(prm.VirtualMode, 0, prm.YEgx)

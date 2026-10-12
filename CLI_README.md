@@ -50,10 +50,11 @@ standard screen: that is also what a file of zeros gets, whose first 128 bytes
 used to pass for a header (0 sums to a stored 0) and which used to render as a
 320x200 or 256x192 screen.
 
-The PNG is emitted at the screen's own resolution, not at the renderer's 640-dot
-canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 /
-768x544 for mode 2. Scaling is nearest neighbour, so no pen colour is blended or
-invented, and the canvas's pixel aspect is preserved.
+The PNG holds the screen's own picture — one pixel per CPC pixel, one row per CRTC
+line — magnified by whole pixels so the mode's pixels come out square: 320x200 /
+256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 / 768x544 for mode 2 (a
+mode-0 picture gains a column per pixel, a mode-2 one a row). Nothing is resampled
+or blended, so no pen colour is invented or lost.
 
 Every screen PNG also **declares the density of the grid it holds**, in the file's
 `pHYs` chunk (unit 1, pixels per metre), so a viewer that honours the chunk has the
@@ -63,8 +64,8 @@ modes divide the same pixel clock, so a mode-0 pixel is half that across and a m
 one twice it — multiplied by however many file pixels that CPC pixel was written as.
 Names aside, the rule is: a mode-1 grid declares 1416 x 1416; a mode-0 default grid
 declares the same, because writing its pixels twice across squares the 708 it starts
-from; a mode-2 default grid declares 2832 x 2832, since it keeps the whole canvas and
-so puts every CPC line on two rows of half the height; a `--native` grid declares the
+from; a mode-2 default grid declares 2832 x 2832, since it doubles every CPC line
+and so puts one file pixel on half the height of a CPC one; a `--native` grid declares the
 mode's own pair (708 x 1416, 1416 x 1416, 2832 x 1416), and `--scale N` multiplies
 both values, because magnifying the file does not magnify the screen. Nothing else is
 claimed — a density, never a size — and most viewers ignore the chunk, which is why
@@ -162,8 +163,8 @@ is given, the screen's own ModePal is ignored — `-v` reports
 input PNG's pixel size, because that is the only signal a bitmap carries. For the
 `-m/--mode` given, a size matches
 
-1. the renderer's canvas — 640x400 standard, 512x384 underscan, 768x544 overscan
-   (these do not depend on the mode);
+1. the size the renderer shows a screen at (its display canvas) — 640x400 standard,
+   512x384 underscan, 768x544 overscan (these do not depend on the mode);
 2. the grid this tool emits a screen PNG with — 320x200, 256x192 and 384x272 for
    modes 0 and 1, the canvases above for mode 2;
 3. the screen's own native grid — 160x200, 128x192 and 192x272 for mode 0;
@@ -410,9 +411,9 @@ cpc-image palette --convert mypalette.pal mypalette.kit
 **Underscan:** Lowers it to 64x192 columns/lines (a 15872-byte dump)
 **CPC Plus:** Uses 4096 color palette instead of standard 27-color palette
 
-SCR→PNG emits the screen's own resolution rather than the renderer's 640-dot
-canvas: 320x200 / 256x192 / 384x272 for modes 0 and 1, 640x400 / 512x384 /
-768x544 for mode 2.
+SCR→PNG writes the screen's own picture with whole pixels duplicated where the
+mode's pixels need it: 320x200 / 256x192 / 384x272 for modes 0 and 1, 640x400 /
+512x384 / 768x544 for mode 2.
 
 ## Examples by Use Case
 

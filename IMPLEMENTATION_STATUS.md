@@ -27,9 +27,10 @@
   underscan 64x192, 31936 overscan 96x272 — and the whole payload is rendered, so
   an overscan dump keeps its lines past 255 instead of losing them to a 16 KB
   read; a payload of no screen size is refused (non-zero exit, nothing written).
-  The PNG is emitted at the screen's own resolution: 320x200 / 256x192 / 384x272
-  for modes 0 and 1 and 640x400 / 512x384 / 768x544 for mode 2, so the renderer's
-  640-dot canvas is halved instead of written out as it is. Every screen PNG also
+  The PNG holds the screen's own picture — one pixel per CPC pixel, one row per
+  CRTC line — magnified by whole pixels so the mode's pixels come out square:
+  320x200 / 256x192 / 384x272 for modes 0 and 1 and 640x400 / 512x384 / 768x544
+  for mode 2. Every screen PNG also
   declares the density of that grid in a `pHYs` chunk (unit 1, pixels per metre,
   right after IHDR) — the density of one CPC pixel times how many file pixels it was
   written as, ~36 DPI for a mode-1 pixel — so a viewer that honours the chunk has the
